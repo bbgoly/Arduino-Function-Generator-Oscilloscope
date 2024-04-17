@@ -1,5 +1,11 @@
+/* Implementation of a Circular/Ring Buffer
+ * By Yousif Kndkji
+ */
+
 #ifndef CIRC_BUFFER_H
 #define CIRC_BUFFER_H
+
+#include <stdint.h>
 
 #define CIRC_BUFFER_DEF(name, size)     \
     uint16_t name##_data[size];         \
@@ -47,4 +53,8 @@ int circ_buffer_pop(circ_buffer_t* c, uint16_t* data) {
     return 0;
 }
 
-#endif
+bool circ_buffer_is_empty(circ_buffer_t* c) {
+    return c->head == c->tail;
+}
+
+#endif // CIRC_BUFFER_H
