@@ -17,6 +17,13 @@
 enum TextAlignment { LeftAlign, RightAlign, CenterAlign };
 enum CircularBorderType { Top, Bottom, Left, Right, All };
 
+typedef void (*callback_t)(void);
+
+// Calibration values for touch screen derived from another program (under gen folder)
+const float xCalM = 0.09, xCalC = -19.88, yCalM = 0.07, yCalC = -21.17;
+
+TS_Point convertTSCoords(Adafruit_ILI9341& lcd, TS_Point p);
+
 class Frame {
 public:
     Frame(unsigned int x, unsigned int y, unsigned int width, unsigned int height, uint16_t frameColor);
@@ -26,7 +33,7 @@ public:
     void setCircularBorderType(CircularBorderType borderType);
     void setFrameColor(uint16_t frameColor);
 
-    virtual void render(Adafruit_ILI9341& lcd);
+    void render(Adafruit_ILI9341& lcd);
     void unrender(Adafruit_ILI9341& lcd, uint16_t backgroundColor);
 
 protected:
@@ -46,6 +53,8 @@ public:
     void setTextAlignment(Adafruit_ILI9341& lcd, TextAlignment align);
     void setTextColor(Adafruit_ILI9341 &lcd, int16_t textColor);
 
+    char* getText();
+
     void render(Adafruit_ILI9341& lcd);
 
 protected:
@@ -58,13 +67,29 @@ protected:
 
 class TextButton : public TextField {
 public:
-    TextButton(unsigned int x, unsigned int y, unsigned int width, unsigned int height, char* text, uint16_t frameColor, uint16_t textColor = ILI9341_WHITE, TextAlignment align = TextAlignment::CenterAlign);
-    TextButton(unsigned int x, unsigned int y, unsigned int width, unsigned int height, char* text, uint16_t frameColor, unsigned int radius, CircularBorderType borderType, uint16_t textColor = ILI9341_WHITE, TextAlignment align = TextAlignment::CenterAlign);
+    TextButton(unsigned int x, unsigned int y, unsigned int width, unsigned int height, char* text, uint16_t frameColor, callback_t buttonPressedCallback, uint16_t textColor = ILI9341_WHITE, TextAlignment align = TextAlignment::CenterAlign);
+    TextButton(unsigned int x, unsigned int y, unsigned int width, unsigned int height, char* text, uint16_t frameColor, callback_t buttonPressedCallback, unsigned int radius, CircularBorderType borderType, uint16_t textColor = ILI9341_WHITE, TextAlignment align = TextAlignment::CenterAlign);
     
 	bool isPressed(TS_Point touchPoint);
+    void executeCallback();
 
-// private:
-    // TODO: add callback when button is pressed probably
+private:
+    // Function pointer to callback function that is called when button is pressed
+    callback_t _buttonPressedCallback;
+};
+
+// template <unsigned int fMax, unsigned int tfMax, unsigned int tbMax>
+class UIContainer {
+public:
+    UIContainer();
+    UIContainer(Frame* frames, TextField* textFields, TextButton* textButtons);
+
+    TextButton& getButton(unsigned int index);
+
+private:
+    Frame* _frames;
+    TextField* _textFields;
+    TextButton* _textButtons;
 };
 
 #endif // ILI9341_UI_H

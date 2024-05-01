@@ -1,5 +1,24 @@
-#include "Adafruit_ILI9341.h"
 #include "ILI9341_UI.h"
+
+TS_Point convertTSCoords(Adafruit_ILI9341& lcd, TS_Point p) {
+    int16_t xCoord = round(p.x * xCalM + xCalC);
+    int16_t yCoord = round(p.y * yCalM + yCalC);
+
+    if (xCoord < 0) 
+        xCoord = 0;
+    else if (xCoord >= lcd.width())
+        xCoord = lcd.width() - 1;
+    
+    if (yCoord < 0)
+        yCoord = 0;
+    else if (yCoord >= lcd.height())
+        yCoord = lcd.height() - 1;
+    p.x = xCoord;
+    p.y = yCoord;
+    return p;
+}
+
+
 
 Frame::Frame(unsigned int x, unsigned int y, unsigned int width, unsigned int height, uint16_t frameColor)
     : _x(x), _y(y), _width(width), _height(height), _frameColor(frameColor), _radius(0), _borderType(CircularBorderType::All) { }
@@ -23,6 +42,14 @@ void Frame::setFrameColor(uint16_t frameColor) {
 }
 
 void Frame::render(Adafruit_ILI9341& lcd) {
+    Serial.print("x: ");
+    Serial.print(_x);
+    Serial.print(" y: ");
+    Serial.print(_y);
+    Serial.print(" width: ");
+    Serial.print(_width);
+    Serial.print(" height: ");
+    Serial.println(_height);
     if (_radius > 0) {
         uint16_t boundaryOffset = min(5*_radius, _width / 2);
         switch (_borderType) {
@@ -129,18 +156,38 @@ void TextField::setAlignedCursor(Adafruit_ILI9341& lcd) {
     }
 }
 
+char* TextField::getText() {
+    return this->_text;
+}
+
 void TextField::render(Adafruit_ILI9341& lcd) {
     Frame::render(lcd);
     this->setText(lcd, _text, _align);
 }
 
 
-TextButton::TextButton(unsigned int x, unsigned int y, unsigned int width, unsigned int height, char* text, uint16_t frameColor, uint16_t textColor, TextAlignment align)
-    : TextField(x, y, width, height, text, frameColor, textColor, align) { }
 
-TextButton::TextButton(unsigned int x, unsigned int y, unsigned int width, unsigned int height, char* text, uint16_t frameColor, unsigned int radius, CircularBorderType borderType, uint16_t textColor, TextAlignment align)
-    : TextField(x, y, width, height, text, frameColor, radius, borderType, textColor, align) { }
+TextButton::TextButton(unsigned int x, unsigned int y, unsigned int width, unsigned int height, char* text, uint16_t frameColor, callback_t buttonPressedCallback, uint16_t textColor, TextAlignment align)
+    : TextField(x, y, width, height, text, frameColor, textColor, align), _buttonPressedCallback(buttonPressedCallback) { }
+
+TextButton::TextButton(unsigned int x, unsigned int y, unsigned int width, unsigned int height, char* text, uint16_t frameColor, callback_t buttonPressedCallback, unsigned int radius, CircularBorderType borderType, uint16_t textColor, TextAlignment align)
+    : TextField(x, y, width, height, text, frameColor, radius, borderType, textColor, align), _buttonPressedCallback(buttonPressedCallback) { }
 
 bool TextButton::isPressed(TS_Point touchPoint) {
     return _isRendered && (touchPoint.x >= _x && touchPoint.x <= (_x + _width) && touchPoint.y >= _y && touchPoint.y <= (_y + _height));
+}
+
+void TextButton::executeCallback() {
+    _buttonPressedCallback();
+}
+
+
+UIContainer::UIContainer() { }
+
+// template <unsigned int fMax, unsigned int tfMax, unsigned int tbMax>
+UIContainer::UIContainer(Frame* frames, TextField* textFields, TextButton* textButtons)
+    : _frames(frames), _textFields(textFields), _textButtons(textButtons) { }
+
+TextButton& UIContainer::getButton(unsigned int index) {
+    return _textButtons[index];
 }
