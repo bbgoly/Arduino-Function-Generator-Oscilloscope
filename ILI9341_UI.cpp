@@ -42,14 +42,6 @@ void Frame::setFrameColor(uint16_t frameColor) {
 }
 
 void Frame::render(Adafruit_ILI9341& lcd) {
-    Serial.print("x: ");
-    Serial.print(_x);
-    Serial.print(" y: ");
-    Serial.print(_y);
-    Serial.print(" width: ");
-    Serial.print(_width);
-    Serial.print(" height: ");
-    Serial.println(_height);
     if (_radius > 0) {
         uint16_t boundaryOffset = min(5*_radius, _width / 2);
         switch (_borderType) {
@@ -88,10 +80,10 @@ void Frame::unrender(Adafruit_ILI9341& lcd, uint16_t backgroundColor) {
 
 
 TextField::TextField(unsigned int x, unsigned int y, unsigned int width, unsigned int height, char* text, uint16_t frameColor, uint16_t textColor, TextAlignment align)
-    : Frame(x, y, width, height, frameColor), _text(text), _textColor(textColor), _align(align) { }
+    : Frame(x, y, width, height, frameColor), _text(text), _textColor(textColor), _align(align), _textPaddingX(5), _textPaddingY(0) { }
 
 TextField::TextField(unsigned int x, unsigned int y, unsigned int width, unsigned int height, char* text, uint16_t frameColor, unsigned int radius, CircularBorderType borderType, uint16_t textColor, TextAlignment align)
-    : Frame(x, y, width, height, frameColor, radius, borderType), _text(text), _textColor(textColor), _align(align) { }
+    : Frame(x, y, width, height, frameColor, radius, borderType), _text(text), _textColor(textColor), _align(align), _textPaddingX(5), _textPaddingY(0) { }
 
 void TextField::setText(Adafruit_ILI9341& lcd, char* text, TextAlignment align) {
     if (_isRendered) {
@@ -131,24 +123,46 @@ void TextField::setTextAlignment(Adafruit_ILI9341 &lcd, TextAlignment align) {
     }
 }
 
-void TextField::setTextColor(Adafruit_ILI9341 &lcd, int16_t textColor) {
+void TextField::setTextColor(uint16_t textColor) {
     _textColor = textColor;
-    this->setText(lcd, _text, _align);
+    // this->setText(lcd, _text, _align);
+}
+
+void TextField::setTextPadding(Adafruit_ILI9341 &lcd, int16_t textPaddingX, int16_t textPaddingY) {
+    if (_isRendered) {
+        this->setAlignedCursor(lcd);
+        lcd.setTextColor(_frameColor);
+        lcd.println(_text);
+
+        _textPaddingX = textPaddingX;
+        _textPaddingY = textPaddingY;
+
+        this->setAlignedCursor(lcd);
+        lcd.setTextColor(_textColor);
+        lcd.println(_text);
+    } else {
+        _textPaddingX = textPaddingX;
+        _textPaddingY = textPaddingY;
+    }
 }
 
 void TextField::setAlignedCursor(Adafruit_ILI9341& lcd) {
     uint16_t textWidth, textHeight;
-    lcd.getTextBounds(_text, _x, _y, NULL, NULL, &textWidth, &textHeight);
+    if (_align == TextAlignment::CenterAlign) {
+        lcd.getTextBounds(_text, _x, _y, NULL, NULL, &textWidth, &textHeight);
+    } else {
+        lcd.getTextBounds(_text, _x + _textPaddingX, _y + _textPaddingY, NULL, NULL, &textWidth, &textHeight);
+    }
 
-    // to calc center its xCursor = x_rect + (width_rect / 2) - (textWidth) / 2
+    // To calculate center its xCursor = x_rect + (width_rect / 2) - (textWidth) / 2
     // and yCursor = y_rect + (height_rect / 2) - (textHeight / 2)
-    // similar approaches for rest
+    // similar approaches for rest, no padding is applied for center alignment
     switch (_align) {
         case LeftAlign:
-            lcd.setCursor(_x, _y + (_height - textHeight) / 2);
+            lcd.setCursor(_x + _textPaddingX, _y + _textPaddingY + (_height - textHeight) / 2);
             break;
         case RightAlign:
-            lcd.setCursor(_x + _width - textWidth, _y + (_height - textHeight) / 2);
+            lcd.setCursor(_x - _textPaddingX + _width - textWidth, _y + _textPaddingY + (_height - textHeight) / 2);
             break;
         case CenterAlign:
             lcd.setCursor(_x + (_width - textWidth) / 2, _y + (_height - textHeight) / 2);
@@ -167,27 +181,35 @@ void TextField::render(Adafruit_ILI9341& lcd) {
 
 
 
-TextButton::TextButton(unsigned int x, unsigned int y, unsigned int width, unsigned int height, char* text, uint16_t frameColor, callback_t buttonPressedCallback, uint16_t textColor, TextAlignment align)
+TextButton::TextButton(unsigned int x, unsigned int y, unsigned int width, unsigned int height, char* text, uint16_t frameColor, button_callback_t buttonPressedCallback, uint16_t textColor, TextAlignment align)
     : TextField(x, y, width, height, text, frameColor, textColor, align), _buttonPressedCallback(buttonPressedCallback) { }
 
-TextButton::TextButton(unsigned int x, unsigned int y, unsigned int width, unsigned int height, char* text, uint16_t frameColor, callback_t buttonPressedCallback, unsigned int radius, CircularBorderType borderType, uint16_t textColor, TextAlignment align)
+TextButton::TextButton(unsigned int x, unsigned int y, unsigned int width, unsigned int height, char* text, uint16_t frameColor, button_callback_t buttonPressedCallback, unsigned int radius, CircularBorderType borderType, uint16_t textColor, TextAlignment align)
     : TextField(x, y, width, height, text, frameColor, radius, borderType, textColor, align), _buttonPressedCallback(buttonPressedCallback) { }
 
 bool TextButton::isPressed(TS_Point touchPoint) {
     return _isRendered && (touchPoint.x >= _x && touchPoint.x <= (_x + _width) && touchPoint.y >= _y && touchPoint.y <= (_y + _height));
 }
 
-void TextButton::executeCallback() {
-    _buttonPressedCallback();
+void TextButton::executeCallback(int sourceButtonIndex) {
+    _buttonPressedCallback(sourceButtonIndex);
 }
 
+// Ugly, but its one time and better than individually typing out a render for each UI element
+void UIPage::renderAll(Adafruit_ILI9341 &lcd, int framesSize, int textFieldsSize, int textButtonsSize) {
+    framesSize = framesSize;
+    textFieldsSize = textFieldsSize;
+    textButtonsSize = textButtonsSize;
 
-UIContainer::UIContainer() { }
+    for (int i = 0; i < framesSize; i++) {
+        frames[i].render(lcd);
+    }
 
-// template <unsigned int fMax, unsigned int tfMax, unsigned int tbMax>
-UIContainer::UIContainer(Frame* frames, TextField* textFields, TextButton* textButtons)
-    : _frames(frames), _textFields(textFields), _textButtons(textButtons) { }
+    for (int i = 0; i < textFieldsSize; i++) {
+        textFields[i].render(lcd);
+    }
 
-TextButton& UIContainer::getButton(unsigned int index) {
-    return _textButtons[index];
+    for (int i = 0; i < textButtonsSize; i++) {
+        textButtons[i].render(lcd);
+    }
 }
