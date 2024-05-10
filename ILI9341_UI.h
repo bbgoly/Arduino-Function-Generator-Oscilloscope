@@ -17,7 +17,7 @@
 enum TextAlignment { LeftAlign, RightAlign, CenterAlign };
 enum CircularBorderType { Top, Bottom, Left, Right, All };
 
-typedef void (*callback_t)(void);
+typedef void (*callback_t)();
 
 // Calibration values for touch screen derived from another program (under gen folder)
 const float xCalM = 0.09, xCalC = -19.88, yCalM = 0.07, yCalC = -21.17;
