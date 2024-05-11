@@ -21,10 +21,12 @@
  */
 
 #include <stdint.h>
+#include <stdio.h>
 #include <math.h>
 #include <SPI.h>
 #include <Adafruit_GFX.h>
 #include <Adafruit_ILI9341.h>
+
 #include <XPT2046_Touchscreen.h>
 #include "circular_buffer.h"
 #include "ILI9341_UI.h"
@@ -48,10 +50,14 @@
 
 constexpr float SAMPLING_RATE = 1000000.0;
 constexpr uint16_t LOOKUP_SIZE = 8192;  // 2^14 8192 16384
+constexpr uint16_t ADC_BUFFER_SIZE = 512;
 
 // The range of voltages that the DAC on the Arduino Due can output according to datasheet
-constexpr float MAX_VOLTAGE = 2.75;
-constexpr float MIN_VOLTAGE = 0.55;
+constexpr float MAX_DAC_VOLTAGE = 2.75;
+constexpr float MIN_DAC_VOLTAGE = 0.55;
+
+// Input voltage range of ADC on the Arduino Due according to the datasheet
+constexpr float ADC_VOLTAGE_RANGE = 3.3;
 
 // Function generator variables
 uint16_t waveformLookupTables[2][LOOKUP_SIZE];
@@ -69,23 +75,23 @@ uint16_t ddsLookup[LOOKUP_SIZE];
 
 // Function generator related rotary encoder variables
 float frequencyStep = 100;
-int freqLastButtonState = 0;
-int amplitudeLastButtonState = 0;
-int waveformLastButtonState = 0;
+int freqLastButtonState = HIGH;
+int amplitudeLastButtonState = HIGH;
+int waveformLastButtonState = HIGH;
 
 // Oscilloscope variables
-uint16_t adcPingPongBuffer[2][512];  // Ping pong double buffer
+uint16_t adcPingPongBuffer[2][ADC_BUFFER_SIZE];  // Ping pong double buffer
 volatile bool swapReadWriteBuffer = false;
 
 circular_buffer_t* circularADCBuffer;
 
+bool oscilloscopeEnabled = true;
+bool oscilloscopeCH1Enabled = true;  // convert to array of enabled channels to feed to adc config in future to expand number of channels
+bool oscilloscopeCH2Enabled = false;
+
 // TFT LCD and touchscreen variables
 Adafruit_ILI9341 lcd(TFT_CS, TFT_DC);
 XPT2046_Touchscreen ts(T_CS);
-
-// Frame* frames;
-// TextField* textFields;
-// TextButton* textButtons;
 
 UIPage UIPages[2];
 int currentDisplayedPage = 0;
@@ -102,18 +108,25 @@ uint32_t lastEncoderDebounce = 0;
 uint32_t holdDownStartTime = 0;
 
 void generateDDSLookup() {
-    tuningWord = pow(2, 32) * outputFrequency / SAMPLING_RATE;
-    ddsLookupSize = SAMPLING_RATE / outputFrequency;  // size is number of times tuning word can go into 32 bits, so size = 2^32 / tuningWord = Fs / Fout
-
     // waveformSelect = 0 => sine wave
     // waveformSelect = 1 => triangle wave
     // waveformSelect = 2 => square wave
-    float voltageRatio = signalPeakVoltage / MAX_VOLTAGE;
+    float voltageRatio = signalPeakVoltage / MAX_DAC_VOLTAGE;
+    
     // if waveformSelect == 2, do something else since thats square wave
-    for (int i = 0; i < ddsLookupSize; i++) {
-        uint32_t phaseIncrement = phaseAccumulator >> (32 - lookupWidth);
-        ddsLookup[i] = voltageRatio * waveformLookupTables[waveformSelect][phaseIncrement];
-        phaseAccumulator += tuningWord;
+    if (waveformSelect == 2) {
+        TC0->TC_CHANNEL[2].TC_RC = VARIANT_MCK / 2 / outputFrequency;
+        ddsLookupSize = 2;
+        ddsLookup[0] = voltageRatio * 0xFFF;
+        ddsLookup[1] = 0;
+    } else {
+        tuningWord = pow(2, 32) * outputFrequency / SAMPLING_RATE;
+        ddsLookupSize = SAMPLING_RATE / outputFrequency;  // size is number of times tuning word can go into 32 bits, so size = 2^32 / tuningWord = Fs / Fout
+        for (int i = 0; i < ddsLookupSize; i++) {
+            uint32_t phaseIncrement = phaseAccumulator >> (32 - lookupWidth);
+            ddsLookup[i] = voltageRatio * waveformLookupTables[waveformSelect][phaseIncrement];
+            phaseAccumulator += tuningWord;
+        }
     }
 }
 
@@ -209,19 +222,22 @@ void setupADCC() {
     ADC->ADC_CR = ADC_CR_SWRST;              // Reset ADCC
     ADC->ADC_MR = ADC_MR_TRGEN_EN            // Enable hardware trigger by one of the TIOA outputs of the internal timer counter channels
                   | ADC_MR_TRGSEL_ADC_TRIG2  // Select TIOA1 (timer counter 0 channel 1) to trigger ADC conversions on rising edge
-                  | ADC_12_BITS
-                  | ADC_MR_FWUP_ON
-                  | ADC_MR_PRESCAL(0);
+                  | ADC_12_BITS              // Set ADC resolution to 12 bits
+                  | ADC_MR_FWUP_ON           // Keep ADC core off between conversions for power saving when ADC is not performing conversions, but keep voltage reference on for fast wakeup
+                  | ADC_MR_PRESCAL(0);       // Set ADC prescaler to 0, which sets ADC clock to 42 MHz (ADCClock = MCK / (PRESCAL + 1)*2) from datasheet, where MCK is 84 MHz)
 
     ADC->ADC_ACR = ADC_ACR_IBCTL(0b01);  // Must use IBCTL = 0b01 for sampling frequency between 500 KHz and 1 MHz according to datasheet
 
-
     // Configure ADC channels and interrupts, and enable ADC IRQ
-    ADC->ADC_CHDR = ~ADC_CHDR_CH7;  // Disable all channels but channel 7
-    ADC->ADC_IDR = ~ADC_IDR_ENDRX;  // Disable all interrupts but ENDRX
-    ADC->ADC_CHER = ADC_CHER_CH7;   // Enable channel 7, which corresponds to A0 on the Arduino
-    ADC->ADC_IER = ADC_IER_ENDRX;   // Enable ADC interrupt to trigger when ENDRX flag is set
-                                    // ENDRX flag is set when ADC_RCR reaches zero (i.e., when DMA receive buffer is full)
+    // ADC->ADC_CHDR = ~ADC_CHDR_CH7;  // Disable all channels but channel 7
+    // ADC->ADC_IDR = ~ADC_IDR_ENDRX;  // Disable all interrupts but ENDRX
+    ADC->ADC_CHER = ADC_CHER_CH7;// | ADC_CHER_CH6;  // Enable channel 7, which corresponds to A0 on the Arduino
+    ADC->ADC_IER = ADC_IER_ENDRX;                 // Enable ADC interrupt to trigger when ENDRX flag is set
+                                                  // ENDRX flag is set when ADC_RCR reaches zero (i.e., when DMA receive buffer is full)
+    ADC->ADC_EMR = ADC_EMR_TAG;                   // Since we are using the PDC receive channel, which triggers each time a new conversion
+                                                  // is stored in ADC_LDCR, and we are looking to make a multi-channel oscilloscope, we must
+                                                  // enable tag mode to have the 4 MSB of the half-word data in ADC_LDCR carry the channel number
+                                                  // associated with that conversion to be able to determine where the data came from later on
 
     NVIC_EnableIRQ(ADC_IRQn);       // Enable ADCC interrupt to trigger when DMA receive buffer is full
     NVIC_SetPriority(ADC_IRQn, 1);  // Set priority of ADCC interrupt to be lower than the DACC interrupt to solve jitter
@@ -246,19 +262,98 @@ void setupADCC() {
     // processor more cycles to process other interrupts and the Arduino loop instead.
 
     ADC->ADC_RPR = (uint32_t)adcPingPongBuffer[0];   // Set first pointer to first receive (write) buffer in ping pong buffer
-    ADC->ADC_RCR = 512;                              // Set size of receive buffer
+    ADC->ADC_RCR = ADC_BUFFER_SIZE;                  // Set size of receive buffer
     ADC->ADC_RNPR = (uint32_t)adcPingPongBuffer[1];  // First pointer is now full and becomes a read buffer, so set second pointer to other receive buffer
-    ADC->ADC_RNCR = 512;                             // Set size of next receive buffer
+    ADC->ADC_RNCR = ADC_BUFFER_SIZE;                 // Set size of next receive buffer
     ADC->ADC_PTCR = ADC_PTCR_RXTEN;                  // Enables half-duplex PDC receive channel requests for ADCC
 }
 
 // Text button callbacks, when text button is touched on LCD, one of these callback functions are invoked
-void testButtonPressed(int sourceButtonIndex) {
-    TextButton sourceButton = UIPages[currentDisplayedPage].textButtons[sourceButtonIndex];
-    sourceButton.setText(lcd, "lol!");
-    delay(500);
-    sourceButton.unrender(lcd, ILI9341_BLACK);
+// Callbacks for oscilloscope UI
+void switchUIPage(int sourceButtonIndex) {
+    // UIPages[currentDisplayedPage].unrenderAll(lcd, ILI9341_BLACK);
+    // currentDisplayedPage = (currentDisplayedPage + 1) & 1;
+    // UIPages[currentDisplayedPage].renderAll(lcd);
 }
+
+void toggleOscilloscope(int sourceButtonIndex) {
+    TextButton* toggleADCButton = UIPages[currentDisplayedPage].getTextButton(sourceButtonIndex);
+    toggleADCButton->unrender(lcd, ILI9341_BLACK);
+    if (oscilloscopeEnabled) {
+        // Disable oscilloscope
+        Serial.println("hello");
+        Serial.println(ADC->ADC_RCR);
+        Serial.println(ADC->ADC_RNCR);
+
+        ADC->ADC_CHDR = 0xFFFF;
+        ADC->ADC_IDR = ~(0ul);
+
+        ADC->ADC_PTCR = ADC_PTCR_RXTDIS;
+
+        toggleADCButton->setFrameColor(ILI9341_RED);
+        toggleADCButton->setBorderColor(ILI9341_UI_DARKRED);
+        toggleADCButton->setText(lcd, "Disabled");
+        oscilloscopeEnabled = false;
+    } else {
+        // Enable oscillscope
+        Serial.println(ADC->ADC_RCR);
+        Serial.println(ADC->ADC_RNCR);
+        // Re-enable all channels and interrupts that were previously enabled
+        ADC->ADC_CHDR = ~(oscilloscopeCH1Enabled << 7 | oscilloscopeCH2Enabled << 6);
+        ADC->ADC_IDR = ~ADC_IDR_ENDRX;
+
+        ADC->ADC_CHER = oscilloscopeCH1Enabled << 7 | oscilloscopeCH2Enabled << 6;
+        ADC->ADC_IER = ADC_IER_ENDRX;
+
+        ADC->ADC_PTCR = ADC_PTCR_RXTEN;
+
+        toggleADCButton->setFrameColor(ILI9341_GREEN);
+        toggleADCButton->setBorderColor(ILI9341_UI_DARKGREEN);
+        toggleADCButton->setText(lcd, "Enabled");
+        oscilloscopeEnabled = true;
+    }
+    toggleADCButton->render(lcd);
+}
+
+void toggleADCChannel1(int sourceButtonIndex) {
+    TextButton* toggleADCCH1 = UIPages[currentDisplayedPage].getTextButton(sourceButtonIndex);
+    toggleADCCH1->unrender(lcd, ILI9341_BLACK);
+    if (ADC->ADC_CHSR & ADC_CHSR_CH7) {
+        toggleADCCH1->setFrameColor(ILI9341_RED);
+        toggleADCCH1->setBorderColor(ILI9341_UI_DARKRED);
+        toggleADCCH1->setText(lcd, "CH1: Disabled");
+        ADC->ADC_CHDR = ~(oscilloscopeCH2Enabled << 6);
+        oscilloscopeCH1Enabled = false;
+    } else {
+        toggleADCCH1->setFrameColor(ILI9341_GREEN);
+        toggleADCCH1->setBorderColor(ILI9341_UI_DARKGREEN);
+        toggleADCCH1->setText(lcd, "CH1: Enabled");
+        ADC->ADC_CHER = ADC_CHER_CH7 | (oscilloscopeCH2Enabled << 6);
+        oscilloscopeCH1Enabled = true;
+    }
+    toggleADCCH1->render(lcd);
+}
+
+void toggleADCChannel2(int sourceButtonIndex) {
+    TextButton* toggleADCCH2 = UIPages[currentDisplayedPage].getTextButton(sourceButtonIndex);
+    toggleADCCH2->unrender(lcd, ILI9341_BLACK);
+    if (ADC->ADC_CHSR & ADC_CHSR_CH6) {
+        toggleADCCH2->setFrameColor(ILI9341_RED);
+        toggleADCCH2->setBorderColor(ILI9341_UI_DARKRED);
+        toggleADCCH2->setText(lcd, "CH2: Disabled");
+        ADC->ADC_CHDR = ~(oscilloscopeCH1Enabled << 7);
+        oscilloscopeCH2Enabled = false;
+    } else {
+        toggleADCCH2->setFrameColor(ILI9341_GREEN);
+        toggleADCCH2->setBorderColor(ILI9341_UI_DARKGREEN);
+        toggleADCCH2->setText(lcd, "CH2: Enabled");
+        ADC->ADC_CHER = ADC_CHER_CH6 | (oscilloscopeCH1Enabled << 7);
+        oscilloscopeCH2Enabled = true;
+    }
+    toggleADCCH2->render(lcd);
+}
+
+// Callbacks for function generator UI
 
 void initLCD() {
     // Configure the TFT LCD and setup hardware SPI connection
@@ -267,32 +362,34 @@ void initLCD() {
     lcd.fillScreen(ILI9341_BLACK);
 
     lcd.setTextSize(1);
-    lcd.setTextColor(ILI9341_WHITE);
 
     // Configure the XPT2046 and setup hardware SPI connection
     ts.begin();
     ts.setRotation(3);
 
-    Frame frames[1] = {
-        Frame(lcd.width() - 200, lcd.height() - 50, 210, 60, ILI9341_WHITE, 10, CircularBorderType::All)
+    // Setup oscilloscope UI page
+    Frame* frames = new Frame[1]{
+        Frame(0, 25 + 6 + 5, lcd.width(), lcd.height() - (25 + 6 + 5) - 20 - 11, ILI9341_BLACK, 1, ILI9341_DARKGREY)
     };
 
-    TextField textFields[3] = {
-        TextField(0, 0, 225, 25, "Status: Oscilloscope Disabled", ILI9341_BLUE, 12, CircularBorderType::Right, ILI9341_WHITE, TextAlignment::LeftAlign),
-        TextField(220, 0, 60, 25, "Power On", ILI9341_GREEN, 10, CircularBorderType::Bottom, ILI9341_BLACK, TextAlignment::CenterAlign),
-        TextField(280, 0, 40, 25, "Switch", ILI9341_WHITE, 10, CircularBorderType::Bottom, ILI9341_BLACK, TextAlignment::CenterAlign),
-        // TextField(lcd.width() - 200, lcd.height() - 50, 200, 50, "")
+    // char formattedStatus[50];
+    // sprintf(formattedStatus, "Status: %.1f MHz @ %d samples", SAMPLING_RATE / 1.0e6, ADC_BUFFER_SIZE);
+    // Serial.println(formattedStatus);
+    TextField* textFields = new TextField[3]{
+        TextField(0, 0, 210, 25, "formattedStatus", ILI9341_BLUE, 15, CircularBorderType::Right, ILI9341_WHITE, TextAlignment::LeftAlign, 3, ILI9341_UI_DARKBLUE),
+        TextField(0, lcd.height() - 20, 47, 20, "0.00 V", ILI9341_BLUE, ILI9341_WHITE, TextAlignment::LeftAlign, 3, ILI9341_UI_DARKBLUE),
+        TextField(47, lcd.height() - 20, 80, 20, "0.0 Hz", ILI9341_BLUE, 10, CircularBorderType::Right, ILI9341_WHITE, TextAlignment::LeftAlign, 3, ILI9341_UI_DARKBLUE)
     };
 
-    TextButton textButtons[2] = {
-        TextButton((lcd.width() - 100) / 2, (lcd.height() - 215) / 2, 100, 100, "Hello World1", ILI9341_RED, testButtonPressed),
-        TextButton((lcd.width() - 100) / 2, (lcd.height() + 15) / 2, 100, 100, "Hello World2", ILI9341_RED, testButtonPressed)
+    TextButton* textButtons = new TextButton[4]{
+        TextButton(280, 0, 40, 25, "Switch", ILI9341_GREEN, switchUIPage, 10, CircularBorderType::Bottom, ILI9341_WHITE, TextAlignment::CenterAlign, 3, ILI9341_UI_DARKGREEN),
+        TextButton(220 - 6, 0, 60, 25, "Enabled", ILI9341_GREEN, toggleOscilloscope, 10, CircularBorderType::Bottom, ILI9341_WHITE, TextAlignment::CenterAlign, 3, ILI9341_UI_DARKGREEN),
+        TextButton(lcd.width() - 180 - 3, lcd.height() - 20, 90, 20, "CH1: Enabled", ILI9341_GREEN, toggleADCChannel1, 10, CircularBorderType::Left, ILI9341_WHITE, TextAlignment::CenterAlign, 3, ILI9341_UI_DARKGREEN),
+        TextButton(lcd.width() - 90, lcd.height() - 20, 90, 20, "CH2: Disabled", ILI9341_RED, toggleADCChannel2, ILI9341_WHITE, TextAlignment::CenterAlign, 3, ILI9341_UI_DARKRED),
     };
 
-    UIPages[0].frames = frames;
-    UIPages[0].textFields = textFields;
-    UIPages[0].textButtons = textButtons;
-    UIPages[0].renderAll(lcd, 1, 3, 2);
+    UIPages[0].setElements(frames, textFields, textButtons, 1, 3, 4);
+    UIPages[0].renderAll(lcd);
 }
 
 void setup() {
@@ -306,9 +403,9 @@ void setup() {
     pinMode(AMP_RE_DT, INPUT_PULLUP);
     pinMode(AMP_RE_CLK, INPUT_PULLUP);
 
-    pinMode(WAVE_RE_SW, INPUT_PULLUP);
-    pinMode(WAVE_RE_DT, INPUT_PULLUP);
-    pinMode(WAVE_RE_CLK, INPUT_PULLUP);
+    // pinMode(WAVE_RE_SW, INPUT_PULLUP);
+    // pinMode(WAVE_RE_DT, INPUT_PULLUP);
+    // pinMode(WAVE_RE_CLK, INPUT_PULLUP);
 
     // Instantiate circular buffer and set size to a power of 2, through testing
     // different frequencies, the buffer seems to reach less than 2^13 entries
@@ -316,9 +413,9 @@ void setup() {
 
     lookupWidth = log2(LOOKUP_SIZE);
 
-    signalPeakVoltage = MAX_VOLTAGE;
-    outputFrequency = 50000;
-    waveformSelect = 0;
+    signalPeakVoltage = MAX_DAC_VOLTAGE;
+    outputFrequency = 1000;
+    waveformSelect = 2;
 
     // Generate sine wave lookup table
     for (int i = 0; i < LOOKUP_SIZE; i++) {
@@ -340,12 +437,13 @@ void setup() {
     pmc_set_writeprotect(false);
 
     // Setup ADC controller registers and the timer counter that will trigger ADC conversions
-    // setupADCC();
-    // setupTCADC();
+    setupADCC();
+    setupTCADC();
+    Serial.println(ADC->ADC_CHER, BIN);
 
     // Setup DAC controller registers and the timer counter that will trigger DAC conversions
-    // setupDACC();
-    // setupTCDACC();
+    setupDACC();
+    setupTCDACC();
 
     lastTouchTime = millis();
     lastEncoderDebounce = millis();
@@ -356,22 +454,45 @@ uint32_t timeElapsed = 0;
 void loop() {
     timeElapsed = micros();
     if (circular_buffer_isFull(circularADCBuffer)) {  // Debugging
-        Serial.println("ADC circular buffer became full! Some data was lost");
+        TextField* statusField = UIPages[0].getTextField(0);
+        statusField->setText(lcd, "ADC CIRCULAR FIFO CAPACITY HIT", ILI9341_RED);
     }
 
     // If circular buffer is populated with conversion values from ADC, DMA it to SD card over SPI
     // to be used for graphing on TFT LCD and so entire waveform can be stored for user's analyzing purposes
     if (!circular_buffer_isEmpty(circularADCBuffer)) {
-        // double freq = 1.0e6 / (double)(timeElapsed - micros());
-        uint16_t adcDataBatch[512];
-        circular_buffer_dequeue(circularADCBuffer, adcDataBatch, 512);
-
-        // For debugging - prints a batch of adc data to view in serial plotter, should display a clean waveform of 512 samples
-        // for (int i = 0; i < 512; i++) {
-        //     Serial.println(adcDataBatch[i]);
-        // }
+        uint16_t adcDataBatch[ADC_BUFFER_SIZE];
+        circular_buffer_dequeue(circularADCBuffer, adcDataBatch, ADC_BUFFER_SIZE);
 
         // DMA batch of data from ADC to SD card over SPI
+
+        // uint16_t maxADCValue = 0;
+        for (int i = 0; i < ADC_BUFFER_SIZE; i++) {
+            // Serial.print("CH ");
+            // Serial.print(adcDataBatch[i] >> 12);
+            // Serial.print(" Data: ");
+            // Uncomment only the next 3 lines to see ADC signal - prints a batch of adc data to view in serial plotter, should display a clean waveform of 512 samples
+            // Serial.print("0, ");
+            // Serial.print(adcDataBatch[i] & 0xFFF);
+            // Serial.println(", 4095");
+            char adcData[5];
+            snprintf(adcData, 5, "%d", adcDataBatch[i] & 0xFFF);
+            printf("%p %p\n", (void*)adcData, (void*)UIPages[0].getTextField(2)->getText());
+            UIPages[0].getTextField(2)->setText(lcd, adcData);
+            //     // if (adcDataBatch[i] > maxADCValue) {
+            //         // maxADCValue = adcDataBatch[i];
+            //     // }
+        }
+
+        // double freq = 0.0; // freq = 1.0e6 / (double)(timeElapsed - micros());
+        // float peakVoltage = maxADCValue * ADC_VOLTAGE_RANGE / pow(2, 12);
+
+        // char peakVoltageText[7], freqText[8];
+        // sprintf(peakVoltageText, "%.2f V", peakVoltage);
+        // sprintf(freqText, ".1f% %s", freq >= 1000.0 ? freq / 1000.0 : freq, freq >= 1000.0 ? "KHz" : "Hz");
+
+        // UIPages[0].textFields[1].setText(lcd, peakVoltageText);
+        // UIPages[0].textFields[2].setText(lcd, freqText);
     }
 
     // If user touches touchscreen and debounce isn't active, then determine
@@ -382,11 +503,11 @@ void loop() {
     // function corresponding to the touched text button(s) and activate debounce
     if (ts.touched() && (millis() - lastTouchTime) > touchDebounceTime) {
         TS_Point touchPoint = convertTSCoords(lcd, ts.getPoint());
-        for (int i = 0; i < 2; i++) {
-            TextButton* textButton = &UIPages[currentDisplayedPage].textButtons[i];
+        for (int i = 0; i < 4; i++) {
+            TextButton* textButton = UIPages[currentDisplayedPage].getTextButton(i);
             if (textButton->isPressed(touchPoint)) {
-                Serial.println("worked");
                 textButton->executeCallback(i);
+                break;
             }
         }
         lastTouchTime = millis();
@@ -428,7 +549,7 @@ void loop() {
         if (wasHeldDown && freqEncoderA == LOW) {                       // If in hold down mode, use pin A to increase frequency step
             frequencyStep = pow(10, min(log10(frequencyStep) + 1, 5));  // Set frequency step to the next multiple of 10, up to 100,000
         } else if (wasHeldDown && freqEncoderB == LOW) {                // If in hold down mode, use pin B to decrease frequency step
-            frequencyStep = pow(10, log10(frequencyStep) - 1);  // Set frequency step to the previous multiple of 10, down until 1
+            frequencyStep = pow(10, log10(frequencyStep) - 1);          // Set frequency step to the previous multiple of 10, down until 1
         } else if (freqEncoderA == LOW) {
             outputFrequency = min(outputFrequency + frequencyStep, SAMPLING_RATE / 2);  // Increment output frequency by frequency step, up to SAMPLING_RATE / 2 (up to 500 KHz)
         } else if (freqEncoderB == LOW && outputFrequency - frequencyStep > 0) {
@@ -458,9 +579,9 @@ void loop() {
 
     int amplitudeEncoderA = digitalRead(AMP_RE_CLK), amplitudeEncoderB = digitalRead(AMP_RE_DT);
     if (amplitudeEncoderA != amplitudeEncoderB && (millis() - lastEncoderDebounce) > encoderDebounceTime) {
-        if (amplitudeEncoderA == LOW && signalPeakVoltage + 0.05 <= (MAX_VOLTAGE + 0.01)) {  // + 0.01 to account for inequality on 2.70 + 0.05 <= 2.75 due to floating precision
+        if (amplitudeEncoderA == LOW && signalPeakVoltage + 0.05 <= (MAX_DAC_VOLTAGE + 0.01)) {  // + 0.01 to account for inequality on 2.70 + 0.05 <= 2.75 due to floating precision
             signalPeakVoltage += 0.05;
-        } else if (amplitudeEncoderB == LOW && signalPeakVoltage - 0.05 >= MIN_VOLTAGE) {
+        } else if (amplitudeEncoderB == LOW && signalPeakVoltage - 0.05 >= MIN_DAC_VOLTAGE) {
             signalPeakVoltage -= 0.05;
         }
         Serial.print("A: ");
@@ -473,23 +594,23 @@ void loop() {
     }
 
     // WAVE_RotaryEncoder functionality, handles waveform shape selection
-    int waveformEncoderButtonState = digitalRead(WAVE_RE_SW);
-    if (waveformLastButtonState == LOW && waveformEncoderButtonState == HIGH && (millis() - lastEncoderDebounce) > buttonDebounceTime) {
-        generateDDSLookup();
-        Serial.println("reconstructed dds waveform from changing waveform shape");
-        lastEncoderDebounce = millis();
-    }
-    waveformLastButtonState = waveformEncoderButtonState;
+    // int waveformEncoderButtonState = digitalRead(WAVE_RE_SW);
+    // if (waveformLastButtonState == LOW && waveformEncoderButtonState == HIGH && (millis() - lastEncoderDebounce) > buttonDebounceTime) {
+    //     generateDDSLookup();
+    //     Serial.println("reconstructed dds waveform from changing waveform shape");
+    //     lastEncoderDebounce = millis();
+    // }
+    // waveformLastButtonState = waveformEncoderButtonState;
 
-    int waveformEncoderA = digitalRead(WAVE_RE_CLK), waveformEncoderB = digitalRead(WAVE_RE_DT);
-    if (waveformEncoderA != waveformEncoderB && (millis() - lastEncoderDebounce) > encoderDebounceTime) {
-        if (waveformEncoderA == LOW && waveformSelect + 1 <= 2) {
-            waveformSelect++;
-        } else if (waveformEncoderB == LOW && waveformSelect - 1 >= 0) {
-            waveformSelect--;
-        }
-        lastEncoderDebounce = millis();
-    }
+    // int waveformEncoderA = digitalRead(WAVE_RE_CLK), waveformEncoderB = digitalRead(WAVE_RE_DT);
+    // if (waveformEncoderA != waveformEncoderB && (millis() - lastEncoderDebounce) > encoderDebounceTime) {
+    //     if (waveformEncoderA == LOW && waveformSelect + 1 <= 2) {
+    //         waveformSelect++;
+    //     } else if (waveformEncoderB == LOW && waveformSelect - 1 >= 0) {
+    //         waveformSelect--;
+    //     }
+    //     lastEncoderDebounce = millis();
+    // }
 }
 
 void DACC_Handler() {
@@ -500,32 +621,10 @@ void DACC_Handler() {
 }
 
 void ADC_Handler() {
-    uint32_t status = ADC->ADC_ISR;
-    // if (status & ADC_ISR_ENDRX) {
-    // }
-    // Serial.print(status, BIN);
-    // Serial.print(" ");
-    // Serial.print(ADC->ADC_RPR, HEX);
-    // Serial.print(" ");
-    // Serial.print(ADC->ADC_RCR, BIN);
-    // Serial.print(" ");
-    // Serial.print(ADC->ADC_RNPR, HEX);
-    // Serial.print(" ");
-    // Serial.println(ADC->ADC_RNCR, BIN);
-
-    circular_buffer_enqueue(circularADCBuffer, adcPingPongBuffer[swapReadWriteBuffer], 512);
-    ADC->ADC_RNPR = (uint32_t)adcPingPongBuffer[swapReadWriteBuffer];
-    ADC->ADC_RNCR = 512;
-    swapReadWriteBuffer = !swapReadWriteBuffer;
-
-    // uint32_t status2 = ADC->ADC_ISR;
-    // Serial.print(status2, BIN);
-    // Serial.print(" ");
-    // Serial.print(ADC->ADC_RPR, HEX);
-    // Serial.print(" ");
-    // Serial.print(ADC->ADC_RCR, BIN);
-    // Serial.print(" ");
-    // Serial.print(ADC->ADC_RNPR, HEX);
-    // Serial.print(" ");
-    // Serial.println(ADC->ADC_RNCR, BIN);
+    if (ADC->ADC_ISR & ADC_ISR_ENDRX) {
+        circular_buffer_enqueue(circularADCBuffer, adcPingPongBuffer[swapReadWriteBuffer], ADC_BUFFER_SIZE);
+        ADC->ADC_RNPR = (uint32_t)adcPingPongBuffer[swapReadWriteBuffer];
+        ADC->ADC_RNCR = ADC_BUFFER_SIZE;
+        swapReadWriteBuffer = !swapReadWriteBuffer;
+    }
 }
