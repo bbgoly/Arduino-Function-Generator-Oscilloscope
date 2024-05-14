@@ -26,7 +26,6 @@
 #include <SPI.h>
 #include <Adafruit_GFX.h>
 #include <Adafruit_ILI9341.h>
-
 #include <XPT2046_Touchscreen.h>
 #include "circular_buffer.h"
 #include "ILI9341_UI.h"
@@ -40,9 +39,9 @@
 #define FREQ_RE_DT 5
 #define FREQ_RE_CLK 6
 
-#define AMP_RE_SW 7
-#define AMP_RE_DT 8
-#define AMP_RE_CLK 9
+#define AMPL_RE_SW 7
+#define AMPL_RE_DT 8
+#define AMPL_RE_CLK 9
 
 #define WAVE_RE_SW 10
 #define WAVE_RE_DT 11
@@ -51,6 +50,7 @@
 constexpr float SAMPLING_RATE = 1000000.0;
 constexpr uint16_t LOOKUP_SIZE = 8192;  // 2^14 8192 16384
 constexpr uint16_t ADC_BUFFER_SIZE = 512;
+constexpr uint8_t WAVEFORM_PREVIEW_SAMPLE_SIZE = 50;
 
 // The range of voltages that the DAC on the Arduino Due can output according to datasheet
 constexpr float MAX_DAC_VOLTAGE = 2.75;
@@ -64,7 +64,8 @@ uint16_t waveformLookupTables[2][LOOKUP_SIZE];
 
 float signalPeakVoltage;
 float outputFrequency;
-int waveformSelect;
+float signalDutyCycle;  // Considered for square waves only
+int8_t waveformSelect;
 
 uint32_t tuningWord;
 uint32_t phaseAccumulator;
@@ -73,11 +74,27 @@ uint8_t lookupWidth;
 uint16_t ddsLookupSize;
 uint16_t ddsLookup[LOOKUP_SIZE];
 
+bool functionGenEnabled = true;
+bool functionGenCH1Enabled = false;
+bool functionGenCH2Enabled = true;
+
 // Function generator related rotary encoder variables
 float frequencyStep = 100;
+
+int changedWaveformSelect;
+float changedSignalDutyCycle;
+float changedOutputFrequency;
+float changedSignalPeakVoltage;
+
+bool wasFreqHeldDown = false;
 int freqLastButtonState = HIGH;
-int amplitudeLastButtonState = HIGH;
-int waveformLastButtonState = HIGH;
+uint32_t freqHoldDownStartTime = 0;
+
+bool wasAmplHeldDown = false;
+int amplLastButtonState = HIGH;
+uint32_t amplHoldDownStartTime = 0;
+
+int waveLastButtonState = HIGH;
 
 // Oscilloscope variables
 uint16_t adcPingPongBuffer[2][ADC_BUFFER_SIZE];  // Ping pong double buffer
@@ -86,7 +103,7 @@ volatile bool swapReadWriteBuffer = false;
 circular_buffer_t* circularADCBuffer;
 
 bool oscilloscopeEnabled = true;
-bool oscilloscopeCH1Enabled = true;  // convert to array of enabled channels to feed to adc config in future to expand number of channels
+bool oscilloscopeCH1Enabled = true;  // convert to array of enabled channels to feed to adc config in future to expand number of channels, could use sequencer as well
 bool oscilloscopeCH2Enabled = false;
 
 // TFT LCD and touchscreen variables
@@ -100,34 +117,36 @@ int touchDebounceTime = 300;
 uint32_t lastTouchTime = 0;
 
 // General rotary encoder variables
-bool wasHeldDown = false;
 int encoderDebounceTime = 50;
 int buttonDebounceTime = 300;
 int buttonHoldTimeThreshold = 500;
 uint32_t lastEncoderDebounce = 0;
-uint32_t holdDownStartTime = 0;
 
 void generateDDSLookup() {
     // waveformSelect = 0 => sine wave
     // waveformSelect = 1 => triangle wave
     // waveformSelect = 2 => square wave
     float voltageRatio = signalPeakVoltage / MAX_DAC_VOLTAGE;
-    
-    // if waveformSelect == 2, do something else since thats square wave
+    ddsLookupSize = SAMPLING_RATE / outputFrequency;  // size is number of times tuning word can go into 32 bits, so size = 2^32 / tuningWord = Fs / Fout
     if (waveformSelect == 2) {
-        TC0->TC_CHANNEL[2].TC_RC = VARIANT_MCK / 2 / outputFrequency;
-        ddsLookupSize = 2;
-        ddsLookup[0] = voltageRatio * 0xFFF;
-        ddsLookup[1] = 0;
+        int highPeriodMax = ddsLookupSize * signalDutyCycle;
+        for (int i = 0; i < ddsLookupSize; i++) {
+            ddsLookup[i] = i < highPeriodMax ? 0xFFF : 0;
+        }
     } else {
         tuningWord = pow(2, 32) * outputFrequency / SAMPLING_RATE;
-        ddsLookupSize = SAMPLING_RATE / outputFrequency;  // size is number of times tuning word can go into 32 bits, so size = 2^32 / tuningWord = Fs / Fout
         for (int i = 0; i < ddsLookupSize; i++) {
             uint32_t phaseIncrement = phaseAccumulator >> (32 - lookupWidth);
             ddsLookup[i] = voltageRatio * waveformLookupTables[waveformSelect][phaseIncrement];
             phaseAccumulator += tuningWord;
         }
     }
+
+    // Change text colors back to default to show user that change was confirmed and applied
+    UIPages[1].getTextField(1)->setTextColor(lcd, ILI9341_WHITE);
+    UIPages[1].getTextField(2)->setTextColor(lcd, ILI9341_WHITE);
+    UIPages[1].getTextField(3)->setTextColor(lcd, ILI9341_WHITE);
+    UIPages[1].getTextField(4)->setTextColor(lcd, ILI9341_WHITE);
 }
 
 void setupTCDACC() {
@@ -229,15 +248,16 @@ void setupADCC() {
     ADC->ADC_ACR = ADC_ACR_IBCTL(0b01);  // Must use IBCTL = 0b01 for sampling frequency between 500 KHz and 1 MHz according to datasheet
 
     // Configure ADC channels and interrupts, and enable ADC IRQ
-    // ADC->ADC_CHDR = ~ADC_CHDR_CH7;  // Disable all channels but channel 7
-    // ADC->ADC_IDR = ~ADC_IDR_ENDRX;  // Disable all interrupts but ENDRX
-    ADC->ADC_CHER = ADC_CHER_CH7;// | ADC_CHER_CH6;  // Enable channel 7, which corresponds to A0 on the Arduino
-    ADC->ADC_IER = ADC_IER_ENDRX;                 // Enable ADC interrupt to trigger when ENDRX flag is set
-                                                  // ENDRX flag is set when ADC_RCR reaches zero (i.e., when DMA receive buffer is full)
-    ADC->ADC_EMR = ADC_EMR_TAG;                   // Since we are using the PDC receive channel, which triggers each time a new conversion
-                                                  // is stored in ADC_LDCR, and we are looking to make a multi-channel oscilloscope, we must
-                                                  // enable tag mode to have the 4 MSB of the half-word data in ADC_LDCR carry the channel number
-                                                  // associated with that conversion to be able to determine where the data came from later on
+    ADC->ADC_CHDR = ~ADC_CHDR_CH7;  // Disable all channels but channel 7
+    ADC->ADC_IDR = ~ADC_IDR_ENDRX;  // Disable all interrupts but ENDRX
+    ADC->ADC_CHER = ADC_CHER_CH7;   // Enable channel 7, which corresponds to A0 on the Arduino
+    ADC->ADC_IER = ADC_IER_ENDRX;   // Enable ADC interrupt to trigger when ENDRX flag is set
+                                    // ENDRX flag is set when ADC_RCR reaches zero (i.e., when DMA receive buffer is full)
+
+    ADC->ADC_EMR = ADC_EMR_TAG;  // Since we are using the PDC receive channel, which triggers each time a new conversion
+                                 // is stored in ADC_LDCR, and we are looking to make a multi-channel oscilloscope, we must
+                                 // enable tag mode to have the 4 MSB of the half-word data in ADC_LDCR carry the channel number
+                                 // associated with that conversion to be able to determine where the data came from later on
 
     NVIC_EnableIRQ(ADC_IRQn);       // Enable ADCC interrupt to trigger when DMA receive buffer is full
     NVIC_SetPriority(ADC_IRQn, 1);  // Set priority of ADCC interrupt to be lower than the DACC interrupt to solve jitter
@@ -271,9 +291,9 @@ void setupADCC() {
 // Text button callbacks, when text button is touched on LCD, one of these callback functions are invoked
 // Callbacks for oscilloscope UI
 void switchUIPage(int sourceButtonIndex) {
-    // UIPages[currentDisplayedPage].unrenderAll(lcd, ILI9341_BLACK);
-    // currentDisplayedPage = (currentDisplayedPage + 1) & 1;
-    // UIPages[currentDisplayedPage].renderAll(lcd);
+    UIPages[currentDisplayedPage].unrenderAll(lcd, ILI9341_BLACK);
+    currentDisplayedPage = (currentDisplayedPage + 1) & 1;
+    UIPages[currentDisplayedPage].renderAll(lcd);
 }
 
 void toggleOscilloscope(int sourceButtonIndex) {
@@ -281,14 +301,10 @@ void toggleOscilloscope(int sourceButtonIndex) {
     toggleADCButton->unrender(lcd, ILI9341_BLACK);
     if (oscilloscopeEnabled) {
         // Disable oscilloscope
-        Serial.println("hello");
-        Serial.println(ADC->ADC_RCR);
-        Serial.println(ADC->ADC_RNCR);
-
         ADC->ADC_CHDR = 0xFFFF;
         ADC->ADC_IDR = ~(0ul);
 
-        ADC->ADC_PTCR = ADC_PTCR_RXTDIS;
+        ADC->ADC_PTCR = ADC_PTCR_RXTDIS;  // Disables PDC DMA receive channel requests
 
         toggleADCButton->setFrameColor(ILI9341_RED);
         toggleADCButton->setBorderColor(ILI9341_UI_DARKRED);
@@ -296,8 +312,6 @@ void toggleOscilloscope(int sourceButtonIndex) {
         oscilloscopeEnabled = false;
     } else {
         // Enable oscillscope
-        Serial.println(ADC->ADC_RCR);
-        Serial.println(ADC->ADC_RNCR);
         // Re-enable all channels and interrupts that were previously enabled
         ADC->ADC_CHDR = ~(oscilloscopeCH1Enabled << 7 | oscilloscopeCH2Enabled << 6);
         ADC->ADC_IDR = ~ADC_IDR_ENDRX;
@@ -316,44 +330,156 @@ void toggleOscilloscope(int sourceButtonIndex) {
 }
 
 void toggleADCChannel1(int sourceButtonIndex) {
-    TextButton* toggleADCCH1 = UIPages[currentDisplayedPage].getTextButton(sourceButtonIndex);
-    toggleADCCH1->unrender(lcd, ILI9341_BLACK);
+    TextButton* toggleADCCH1Button = UIPages[currentDisplayedPage].getTextButton(sourceButtonIndex);
+    toggleADCCH1Button->unrender(lcd, ILI9341_BLACK);
     if (ADC->ADC_CHSR & ADC_CHSR_CH7) {
-        toggleADCCH1->setFrameColor(ILI9341_RED);
-        toggleADCCH1->setBorderColor(ILI9341_UI_DARKRED);
-        toggleADCCH1->setText(lcd, "CH1: Disabled");
+        toggleADCCH1Button->setFrameColor(ILI9341_RED);
+        toggleADCCH1Button->setBorderColor(ILI9341_UI_DARKRED);
+        toggleADCCH1Button->setText(lcd, "A0: Disabled");
         ADC->ADC_CHDR = ~(oscilloscopeCH2Enabled << 6);
         oscilloscopeCH1Enabled = false;
     } else {
-        toggleADCCH1->setFrameColor(ILI9341_GREEN);
-        toggleADCCH1->setBorderColor(ILI9341_UI_DARKGREEN);
-        toggleADCCH1->setText(lcd, "CH1: Enabled");
+        toggleADCCH1Button->setFrameColor(ILI9341_GREEN);
+        toggleADCCH1Button->setBorderColor(ILI9341_UI_DARKGREEN);
+        toggleADCCH1Button->setText(lcd, "A0: Enabled");
         ADC->ADC_CHER = ADC_CHER_CH7 | (oscilloscopeCH2Enabled << 6);
         oscilloscopeCH1Enabled = true;
     }
-    toggleADCCH1->render(lcd);
+    toggleADCCH1Button->render(lcd);
 }
 
 void toggleADCChannel2(int sourceButtonIndex) {
-    TextButton* toggleADCCH2 = UIPages[currentDisplayedPage].getTextButton(sourceButtonIndex);
-    toggleADCCH2->unrender(lcd, ILI9341_BLACK);
+    TextButton* toggleADCCH2Button = UIPages[currentDisplayedPage].getTextButton(sourceButtonIndex);
+    toggleADCCH2Button->unrender(lcd, ILI9341_BLACK);
     if (ADC->ADC_CHSR & ADC_CHSR_CH6) {
-        toggleADCCH2->setFrameColor(ILI9341_RED);
-        toggleADCCH2->setBorderColor(ILI9341_UI_DARKRED);
-        toggleADCCH2->setText(lcd, "CH2: Disabled");
+        toggleADCCH2Button->setFrameColor(ILI9341_RED);
+        toggleADCCH2Button->setBorderColor(ILI9341_UI_DARKRED);
+        toggleADCCH2Button->setText(lcd, "A1: Disabled");
         ADC->ADC_CHDR = ~(oscilloscopeCH1Enabled << 7);
         oscilloscopeCH2Enabled = false;
     } else {
-        toggleADCCH2->setFrameColor(ILI9341_GREEN);
-        toggleADCCH2->setBorderColor(ILI9341_UI_DARKGREEN);
-        toggleADCCH2->setText(lcd, "CH2: Enabled");
+        toggleADCCH2Button->setFrameColor(ILI9341_GREEN);
+        toggleADCCH2Button->setBorderColor(ILI9341_UI_DARKGREEN);
+        toggleADCCH2Button->setText(lcd, "A1: Enabled");
         ADC->ADC_CHER = ADC_CHER_CH6 | (oscilloscopeCH1Enabled << 7);
         oscilloscopeCH2Enabled = true;
     }
-    toggleADCCH2->render(lcd);
+    toggleADCCH2Button->render(lcd);
+}
+
+void toggleFunctionGenerator(int sourceButtonIndex) {
+    TextButton* toggleFuncGenButton = UIPages[currentDisplayedPage].getTextButton(sourceButtonIndex);
+    toggleFuncGenButton->unrender(lcd, ILI9341_BLACK);
+    if (functionGenEnabled) {
+        // Disable function generator
+        DACC->DACC_CHDR = 0b11;  // only 2 possible channels
+        DACC->DACC_IDR = 0xF;    // only 4 interrupt flags
+
+        DACC->DACC_PTCR = DACC_PTCR_TXTDIS;  // Disables PDC DMA transmit channel requests
+
+        toggleFuncGenButton->setFrameColor(ILI9341_RED);
+        toggleFuncGenButton->setBorderColor(ILI9341_UI_DARKRED);
+        toggleFuncGenButton->setText(lcd, "Disabled");
+        functionGenEnabled = false;
+    } else {
+        // Enable function generator, and re-enable all channels and interrupts that were previously enabled
+        DACC->DACC_CHDR = ~((functionGenCH2Enabled << 1) | functionGenCH1Enabled);
+        DACC->DACC_IDR = ~DACC_IDR_TXBUFE;
+
+        DACC->DACC_CHER = (functionGenCH2Enabled << 1) | functionGenCH1Enabled;
+        DACC->DACC_IER = DACC_IER_TXBUFE;
+
+        DACC->DACC_PTCR = DACC_PTCR_TXTEN;
+
+        toggleFuncGenButton->setFrameColor(ILI9341_GREEN);
+        toggleFuncGenButton->setBorderColor(ILI9341_UI_DARKGREEN);
+        toggleFuncGenButton->setText(lcd, "Enabled");
+        functionGenEnabled = true;
+    }
+    toggleFuncGenButton->render(lcd);
+}
+
+void toggleDACChannel1(int sourceButtonIndex) {
+    TextButton* toggleDACCH1Button = UIPages[currentDisplayedPage].getTextButton(sourceButtonIndex);
+    toggleDACCH1Button->unrender(lcd, ILI9341_BLACK);
+    if (DACC->DACC_CHSR & DACC_CHSR_CH0) {
+        toggleDACCH1Button->setFrameColor(ILI9341_RED);
+        toggleDACCH1Button->setBorderColor(ILI9341_UI_DARKRED);
+        toggleDACCH1Button->setText(lcd, "DAC0: Disabled");
+
+        DACC->DACC_CHDR = ~(functionGenCH2Enabled << 1);
+        functionGenCH1Enabled = false;
+    } else {
+        toggleDACCH1Button->setFrameColor(ILI9341_GREEN);
+        toggleDACCH1Button->setBorderColor(ILI9341_UI_DARKGREEN);
+        toggleDACCH1Button->setText(lcd, "DAC0: Enabled");
+
+        DACC->DACC_CHER = (functionGenCH2Enabled << 1) | DACC_CHER_CH0;
+        functionGenCH1Enabled = true;
+    }
+    toggleDACCH1Button->render(lcd);
+}
+
+void toggleDACChannel2(int sourceButtonIndex) {
+    TextButton* toggleDACCH2Button = UIPages[currentDisplayedPage].getTextButton(sourceButtonIndex);
+    toggleDACCH2Button->unrender(lcd, ILI9341_BLACK);
+    if (DACC->DACC_CHSR & DACC_CHSR_CH1) {
+        toggleDACCH2Button->setFrameColor(ILI9341_RED);
+        toggleDACCH2Button->setBorderColor(ILI9341_UI_DARKRED);
+        toggleDACCH2Button->setText(lcd, "DAC1: Disabled");
+
+        DACC->DACC_CHDR = ~functionGenCH1Enabled;
+        functionGenCH1Enabled = false;
+    } else {
+        toggleDACCH2Button->setFrameColor(ILI9341_GREEN);
+        toggleDACCH2Button->setBorderColor(ILI9341_UI_DARKGREEN);
+        toggleDACCH2Button->setText(lcd, "DAC1: Enabled");
+
+        DACC->DACC_CHER = DACC_CHER_CH1 | functionGenCH1Enabled;
+        functionGenCH1Enabled = true;
+    }
+    toggleDACCH2Button->render(lcd);
 }
 
 // Callbacks for function generator UI
+void displayWaveformPreview() {
+    char waveformText[19];
+    uint16_t waveStartX = lcd.width() / 2 + 20, waveStartY = lcd.height() / 2;
+    switch (abs(changedWaveformSelect)) {
+        case 0:  // sine wave
+            snprintf(waveformText, 15, "Waveform: Sine");
+            for (int i = 0; i < WAVEFORM_PREVIEW_SAMPLE_SIZE; i++) {
+                lcd.fillRect(waveStartX + 2 * i, waveStartY + 40 * sin(2.0 * PI * (float)i / WAVEFORM_PREVIEW_SAMPLE_SIZE), 2, 2, ILI9341_WHITE);
+            }
+            UIPages[1].getTextField(4)->setFormattedText(lcd, 20, 0, "Step: %.0f Hz", frequencyStep);
+            break;
+        case 1:  // triangle wave
+            snprintf(waveformText, 19, "Waveform: Triangle");
+            for (int i = 0; i < WAVEFORM_PREVIEW_SAMPLE_SIZE; i++) {
+                float xCoord = (float)(i) / WAVEFORM_PREVIEW_SAMPLE_SIZE;
+                lcd.fillRect(waveStartX + 2 * i, waveStartY - 40 * (2.0 * fabs(xCoord - floor(xCoord + 0.5)) - 0.5), 2, 2, ILI9341_WHITE);
+            }
+            UIPages[1].getTextField(4)->setFormattedText(lcd, 20, 0, "Step: %.0f Hz", frequencyStep);
+            break;
+        case 2:  // square wave
+            snprintf(waveformText, 17, "Waveform: Square");
+            bool prevState = true;
+            int highPeriodMax = WAVEFORM_PREVIEW_SAMPLE_SIZE * fabs(changedSignalDutyCycle);
+            // Serial.println(changedSignalDutyCycle);
+            for (int i = 0; i < WAVEFORM_PREVIEW_SAMPLE_SIZE; i++) {
+                bool waveState = i < highPeriodMax;
+                int16_t samplePosX = waveStartX + 2 * i, samplePosY = 20 * (waveState ? 1 : -1);
+                if (prevState != waveState) {
+                    lcd.drawFastVLine(samplePosX, waveStartY + samplePosY, 40, ILI9341_WHITE);
+                }
+                lcd.fillRect(samplePosX, waveStartY - samplePosY, 2, 2, ILI9341_WHITE);
+                prevState = waveState;
+            }
+            UIPages[1].getTextField(4)->setFormattedText(lcd, 17, 0, "Duty Cycle: %.0f%%", changedSignalDutyCycle * 100);
+            break;
+    }
+    UIPages[1].getTextField(1)->setText(lcd, waveformText, changedWaveformSelect == waveformSelect ? ILI9341_WHITE : ILI9341_RED);  // Change color to that waveform selection was changed and will be applied if confirmed
+}
 
 void initLCD() {
     // Configure the TFT LCD and setup hardware SPI connection
@@ -368,28 +494,53 @@ void initLCD() {
     ts.setRotation(3);
 
     // Setup oscilloscope UI page
-    Frame* frames = new Frame[1]{
+    Frame* oscilFrames = new Frame[1]{
         Frame(0, 25 + 6 + 5, lcd.width(), lcd.height() - (25 + 6 + 5) - 20 - 11, ILI9341_BLACK, 1, ILI9341_DARKGREY)
     };
 
-    // char formattedStatus[50];
-    // sprintf(formattedStatus, "Status: %.1f MHz @ %d samples", SAMPLING_RATE / 1.0e6, ADC_BUFFER_SIZE);
-    // Serial.println(formattedStatus);
-    TextField* textFields = new TextField[3]{
-        TextField(0, 0, 210, 25, "formattedStatus", ILI9341_BLUE, 15, CircularBorderType::Right, ILI9341_WHITE, TextAlignment::LeftAlign, 3, ILI9341_UI_DARKBLUE),
+    TextField* oscilTextFields = new TextField[3]{
+        TextField(0, 0, 210, 25, "", ILI9341_BLUE, 15, CircularBorderType::Right, ILI9341_WHITE, TextAlignment::LeftAlign, 3, ILI9341_UI_DARKBLUE),
         TextField(0, lcd.height() - 20, 47, 20, "0.00 V", ILI9341_BLUE, ILI9341_WHITE, TextAlignment::LeftAlign, 3, ILI9341_UI_DARKBLUE),
         TextField(47, lcd.height() - 20, 80, 20, "0.0 Hz", ILI9341_BLUE, 10, CircularBorderType::Right, ILI9341_WHITE, TextAlignment::LeftAlign, 3, ILI9341_UI_DARKBLUE)
     };
+    oscilTextFields[0].setFormattedText(lcd, 35, 0, "Status: %.1f MHz @ %d samples", SAMPLING_RATE / 1.0e6, ADC_BUFFER_SIZE);
 
-    TextButton* textButtons = new TextButton[4]{
+    TextButton* oscilTextButtons = new TextButton[4]{
         TextButton(280, 0, 40, 25, "Switch", ILI9341_GREEN, switchUIPage, 10, CircularBorderType::Bottom, ILI9341_WHITE, TextAlignment::CenterAlign, 3, ILI9341_UI_DARKGREEN),
         TextButton(220 - 6, 0, 60, 25, "Enabled", ILI9341_GREEN, toggleOscilloscope, 10, CircularBorderType::Bottom, ILI9341_WHITE, TextAlignment::CenterAlign, 3, ILI9341_UI_DARKGREEN),
-        TextButton(lcd.width() - 180 - 3, lcd.height() - 20, 90, 20, "CH1: Enabled", ILI9341_GREEN, toggleADCChannel1, 10, CircularBorderType::Left, ILI9341_WHITE, TextAlignment::CenterAlign, 3, ILI9341_UI_DARKGREEN),
-        TextButton(lcd.width() - 90, lcd.height() - 20, 90, 20, "CH2: Disabled", ILI9341_RED, toggleADCChannel2, ILI9341_WHITE, TextAlignment::CenterAlign, 3, ILI9341_UI_DARKRED),
+        TextButton(lcd.width() - 180 - 3, lcd.height() - 20, 90, 20, "A0: Enabled", ILI9341_GREEN, toggleADCChannel1, 10, CircularBorderType::Left, ILI9341_WHITE, TextAlignment::CenterAlign, 3, ILI9341_UI_DARKGREEN),
+        TextButton(lcd.width() - 90, lcd.height() - 20, 90, 20, "A1: Disabled", ILI9341_RED, toggleADCChannel2, ILI9341_WHITE, TextAlignment::CenterAlign, 3, ILI9341_UI_DARKRED),
     };
 
-    UIPages[0].setElements(frames, textFields, textButtons, 1, 3, 4);
+    UIPages[0].setElements(oscilFrames, oscilTextFields, oscilTextButtons, 1, 3, 4);
     UIPages[0].renderAll(lcd);
+
+    // Setup function generator UI page
+    Frame* funcFrames = new Frame[3]{
+        Frame(25, 60, lcd.width() - 50, lcd.height() - 120, ILI9341_BLUE, 10, CircularBorderType::All, 4, ILI9341_UI_DARKBLUE),
+        Frame(lcd.width() / 2 + 20 - 5, 75, 110, 90, ILI9341_UI_DARKBLUE, 10, CircularBorderType::All, 3, ILI9341_UI_DARKBLUE),
+        Frame(30 + 3, 80, 120, 80, ILI9341_UI_DARKBLUE, 10, CircularBorderType::All, 3, ILI9341_UI_DARKBLUE)  // - 5
+    };
+    funcFrames[1].setOnRenderCallback(displayWaveformPreview);
+
+    TextField* funcTextFields = new TextField[5]{
+        TextField(0, 0, 210, 25, "", ILI9341_BLUE, 15, CircularBorderType::Right, ILI9341_WHITE, TextAlignment::LeftAlign, 5, ILI9341_UI_DARKBLUE),
+        TextField(30, 80, 0, 20, "Waveform: Sine", ILI9341_UI_DARKBLUE, ILI9341_WHITE, TextAlignment::LeftAlign),
+        TextField(30, 100, 0, 20, "Amplitude: 2.75 V", ILI9341_UI_DARKBLUE, ILI9341_WHITE, TextAlignment::LeftAlign),
+        TextField(30, 120, 0, 20, "Frequency: 1 KHz", ILI9341_UI_DARKBLUE, ILI9341_WHITE, TextAlignment::LeftAlign),
+        TextField(30, 140, 0, 20, "Step: 100 Hz", ILI9341_UI_DARKBLUE, ILI9341_WHITE, TextAlignment::LeftAlign)
+    };
+    funcTextFields[0].setFormattedText(lcd, 35, 0, "Status: %.2f MHz @ %d samples", SAMPLING_RATE / 1.0e6, LOOKUP_SIZE);
+
+    // change to func gen stuff
+    TextButton* funcTextButtons = new TextButton[4]{
+        TextButton(280, 0, 40, 25, "Switch", ILI9341_GREEN, switchUIPage, 10, CircularBorderType::Bottom, ILI9341_WHITE, TextAlignment::CenterAlign, 3, ILI9341_UI_DARKGREEN),
+        TextButton(220 - 6, 0, 60, 25, "Enabled", ILI9341_GREEN, toggleFunctionGenerator, 10, CircularBorderType::Bottom, ILI9341_WHITE, TextAlignment::CenterAlign, 3, ILI9341_UI_DARKGREEN),
+        TextButton(lcd.width() - 180 - 3, lcd.height() - 20, 90, 20, "DAC0: Disabled", ILI9341_RED, toggleDACChannel1, 10, CircularBorderType::Left, ILI9341_WHITE, TextAlignment::CenterAlign, 3, ILI9341_UI_DARKRED),
+        TextButton(lcd.width() - 90, lcd.height() - 20, 90, 20, "DAC1: Enabled", ILI9341_GREEN, toggleDACChannel2, ILI9341_WHITE, TextAlignment::CenterAlign, 3, ILI9341_UI_DARKGREEN)
+    };
+
+    UIPages[1].setElements(funcFrames, funcTextFields, funcTextButtons, 3, 5, 4);
 }
 
 void setup() {
@@ -399,13 +550,13 @@ void setup() {
     pinMode(FREQ_RE_DT, INPUT_PULLUP);
     pinMode(FREQ_RE_CLK, INPUT_PULLUP);
 
-    pinMode(AMP_RE_SW, INPUT_PULLUP);
-    pinMode(AMP_RE_DT, INPUT_PULLUP);
-    pinMode(AMP_RE_CLK, INPUT_PULLUP);
+    pinMode(AMPL_RE_SW, INPUT_PULLUP);
+    pinMode(AMPL_RE_DT, INPUT_PULLUP);
+    pinMode(AMPL_RE_CLK, INPUT_PULLUP);
 
-    // pinMode(WAVE_RE_SW, INPUT_PULLUP);
-    // pinMode(WAVE_RE_DT, INPUT_PULLUP);
-    // pinMode(WAVE_RE_CLK, INPUT_PULLUP);
+    pinMode(WAVE_RE_SW, INPUT_PULLUP);
+    pinMode(WAVE_RE_DT, INPUT_PULLUP);
+    pinMode(WAVE_RE_CLK, INPUT_PULLUP);
 
     // Instantiate circular buffer and set size to a power of 2, through testing
     // different frequencies, the buffer seems to reach less than 2^13 entries
@@ -415,7 +566,16 @@ void setup() {
 
     signalPeakVoltage = MAX_DAC_VOLTAGE;
     outputFrequency = 1000;
-    waveformSelect = 2;
+    signalDutyCycle = 0.5;
+    waveformSelect = 0;
+
+    // variables used to preview changes in function generator paramters for ui and rotary encoders
+    changedSignalPeakVoltage = signalPeakVoltage;
+    changedOutputFrequency = outputFrequency;
+    changedSignalDutyCycle = signalDutyCycle;
+    changedWaveformSelect = waveformSelect;
+
+    initLCD();
 
     // Generate sine wave lookup table
     for (int i = 0; i < LOOKUP_SIZE; i++) {
@@ -423,7 +583,14 @@ void setup() {
     }
 
     // Generate triangle wave lookup table
-    // ...
+    for (int i = 0; i < LOOKUP_SIZE; i++) {
+        waveformLookupTables[1][i] = (uint16_t)(4095.0 * (1.0 - fabs(2.0 * i / LOOKUP_SIZE - 1.0)));
+    }
+
+    // Generate square wave lookup table with default duty cycle of 50%
+    // for (int i = 0; i < LOOKUP_SIZE; i++) {
+    //     waveformLookupTables[2][i] = i < LOOKUP_SIZE * signalDutyCycle ? 0xFFF : 0;
+    // }
     generateDDSLookup();
 
     Serial.print("\nTuning word: ");
@@ -431,15 +598,12 @@ void setup() {
     Serial.print("DDS lookup table size: ");
     Serial.println(ddsLookupSize);
 
-    initLCD();
-
     // Disable register write protection in the power management controller
     pmc_set_writeprotect(false);
 
     // Setup ADC controller registers and the timer counter that will trigger ADC conversions
     setupADCC();
     setupTCADC();
-    Serial.println(ADC->ADC_CHER, BIN);
 
     // Setup DAC controller registers and the timer counter that will trigger DAC conversions
     setupDACC();
@@ -449,11 +613,8 @@ void setup() {
     lastEncoderDebounce = millis();
 }
 
-uint32_t timeElapsed = 0;
-
 void loop() {
-    timeElapsed = micros();
-    if (circular_buffer_isFull(circularADCBuffer)) {  // Debugging
+    if (circular_buffer_isFull(circularADCBuffer)) {  // Warning in case buffer ever fills beyond its capacity (highly unlikely, never had this happen before in all my tests)
         TextField* statusField = UIPages[0].getTextField(0);
         statusField->setText(lcd, "ADC CIRCULAR FIFO CAPACITY HIT", ILI9341_RED);
     }
@@ -466,33 +627,28 @@ void loop() {
 
         // DMA batch of data from ADC to SD card over SPI
 
-        // uint16_t maxADCValue = 0;
-        for (int i = 0; i < ADC_BUFFER_SIZE; i++) {
-            // Serial.print("CH ");
-            // Serial.print(adcDataBatch[i] >> 12);
-            // Serial.print(" Data: ");
-            // Uncomment only the next 3 lines to see ADC signal - prints a batch of adc data to view in serial plotter, should display a clean waveform of 512 samples
-            // Serial.print("0, ");
-            // Serial.print(adcDataBatch[i] & 0xFFF);
-            // Serial.println(", 4095");
-            char adcData[5];
-            snprintf(adcData, 5, "%d", adcDataBatch[i] & 0xFFF);
-            printf("%p %p\n", (void*)adcData, (void*)UIPages[0].getTextField(2)->getText());
-            UIPages[0].getTextField(2)->setText(lcd, adcData);
-            //     // if (adcDataBatch[i] > maxADCValue) {
-            //         // maxADCValue = adcDataBatch[i];
-            //     // }
+
+        if (currentDisplayedPage == 0) {
+            uint16_t maxADCValue = 0;
+            for (int i = 0; i < ADC_BUFFER_SIZE; i++) {
+                // Serial.print("CH ");
+                // Serial.print(adcDataBatch[i] >> 12);
+                // Serial.print(" Data: ");
+
+                uint16_t adcData = adcDataBatch[i] & 0xFFF;
+                // Uncomment only the next 3 lines to see ADC signal - prints a batch of adc data to view in serial plotter, should display a clean 512 sample waveform
+                // Serial.print("0, ");
+                Serial.println(adcData);
+                // Serial.println(", 4095");
+                if (adcData > maxADCValue) {
+                    maxADCValue = adcData;
+                }
+            }
+            UIPages[0].getTextField(1)->setFormattedText(lcd, 7, 0, "%.2f V", maxADCValue * ADC_VOLTAGE_RANGE / pow(2, 12));  // Voltage = AnalogValue * (Vref+ - Vref-)/2^n
+
+            // double freq = 1.0e6 / (double)(timeElapsed - micros()); // not valid method
+            // UIPages[0].getTextField(2)->setFormattedText(lcd, 9, "%.1f %s", freq >= 1000.0 ? freq / 1000.0 : freq, freq >= 1000.0 ? "KHz" : "Hz");
         }
-
-        // double freq = 0.0; // freq = 1.0e6 / (double)(timeElapsed - micros());
-        // float peakVoltage = maxADCValue * ADC_VOLTAGE_RANGE / pow(2, 12);
-
-        // char peakVoltageText[7], freqText[8];
-        // sprintf(peakVoltageText, "%.2f V", peakVoltage);
-        // sprintf(freqText, ".1f% %s", freq >= 1000.0 ? freq / 1000.0 : freq, freq >= 1000.0 ? "KHz" : "Hz");
-
-        // UIPages[0].textFields[1].setText(lcd, peakVoltageText);
-        // UIPages[0].textFields[2].setText(lcd, freqText);
     }
 
     // If user touches touchscreen and debounce isn't active, then determine
@@ -503,7 +659,7 @@ void loop() {
     // function corresponding to the touched text button(s) and activate debounce
     if (ts.touched() && (millis() - lastTouchTime) > touchDebounceTime) {
         TS_Point touchPoint = convertTSCoords(lcd, ts.getPoint());
-        for (int i = 0; i < 4; i++) {
+        for (int i = 0; i < UIPages[currentDisplayedPage].textButtonsSize; i++) {
             TextButton* textButton = UIPages[currentDisplayedPage].getTextButton(i);
             if (textButton->isPressed(touchPoint)) {
                 textButton->executeCallback(i);
@@ -519,101 +675,158 @@ void loop() {
     // different parameter values as each rotary encoder configures parameters
     // that will result in the waveform being recomputed afterwards.
 
-    // FREQ_RotaryEncoder functionality, handles waveform frequency control on the
-    // function generator side and allows the user to control the frequency step
-    // value if they hold down the switch for 0.5 seconds or more
-    int freqEncoderButtonState = digitalRead(FREQ_RE_SW);
-    if (freqEncoderButtonState == HIGH) {  // While switch is not being pressed, reset hold down timer
-        holdDownStartTime = millis();
-    }
-
-    // We don't want to re-compute waveform table during any switch press while in hold down mode, as output frequency can't change in hold down mode
-    if (!wasHeldDown && freqLastButtonState == LOW && freqEncoderButtonState == HIGH && (millis() - lastEncoderDebounce) > buttonDebounceTime) {
-        generateDDSLookup();
-        Serial.println("reconstructed dds waveform from frequency change");
-        lastEncoderDebounce = millis();
-    }
-    // Serial.print((millis() - holdDownStartTime) > buttonHoldTimeThreshold);
-    // Serial.print(" - ");
-    // Serial.println(wasHeldDown);
-    if (wasHeldDown && freqLastButtonState == HIGH && freqEncoderButtonState == LOW) {
-        wasHeldDown = false;             // Press switch again to disable hold down mode
-        lastEncoderDebounce = millis();  // re-enables debounce to prevent recomputing waveform after pressing switch to disable hold down mode
-    } else if ((millis() - holdDownStartTime) > buttonHoldTimeThreshold) {
-        wasHeldDown = true;  // If switch is held down long enough, enable hold down mode
-    }
-    freqLastButtonState = freqEncoderButtonState;
-
-    int freqEncoderA = digitalRead(FREQ_RE_CLK), freqEncoderB = digitalRead(FREQ_RE_DT);
-    if (freqEncoderA != freqEncoderB && (millis() - lastEncoderDebounce) > encoderDebounceTime) {
-        if (wasHeldDown && freqEncoderA == LOW) {                       // If in hold down mode, use pin A to increase frequency step
-            frequencyStep = pow(10, min(log10(frequencyStep) + 1, 5));  // Set frequency step to the next multiple of 10, up to 100,000
-        } else if (wasHeldDown && freqEncoderB == LOW) {                // If in hold down mode, use pin B to decrease frequency step
-            frequencyStep = pow(10, log10(frequencyStep) - 1);          // Set frequency step to the previous multiple of 10, down until 1
-        } else if (freqEncoderA == LOW) {
-            outputFrequency = min(outputFrequency + frequencyStep, SAMPLING_RATE / 2);  // Increment output frequency by frequency step, up to SAMPLING_RATE / 2 (up to 500 KHz)
-        } else if (freqEncoderB == LOW && outputFrequency - frequencyStep > 0) {
-            outputFrequency -= frequencyStep;  // Decrement output frequency by frequency step, down until 1 Hz
+    if (currentDisplayedPage == 1) {
+        // FREQ_RotaryEncoder functionality, handles waveform frequency control on the
+        // function generator side and allows the user to control the frequency step
+        // value if they hold down the switch for 0.5 seconds or more
+        int freqEncoderButtonState = digitalRead(FREQ_RE_SW);
+        if (freqEncoderButtonState == HIGH) {  // While switch is not being pressed, reset hold down timer
+            freqHoldDownStartTime = millis();
         }
 
-        Serial.print("A: ");
-        Serial.print(freqEncoderA);
-        Serial.print(" - B: ");
-        Serial.print(freqEncoderB);
-        Serial.print("\tfreqStep: ");
-        Serial.print(frequencyStep);
-        Serial.print(" - outputFreq: ");
-        Serial.println(outputFrequency);
-        lastEncoderDebounce = millis();
-    }
-
-
-    // AMP_RotaryEncoder functionality, controls peak voltage of waveform in steps of 0.05 V (50 mV)
-    int amplitudeEncoderButtonState = digitalRead(AMP_RE_SW);
-    if (amplitudeLastButtonState == LOW && amplitudeEncoderButtonState == HIGH && (millis() - lastEncoderDebounce) > buttonDebounceTime) {
-        generateDDSLookup();
-        Serial.println("reconstructed dds waveform from peak amplitude change");
-        lastEncoderDebounce = millis();
-    }
-    amplitudeLastButtonState = amplitudeEncoderButtonState;
-
-    int amplitudeEncoderA = digitalRead(AMP_RE_CLK), amplitudeEncoderB = digitalRead(AMP_RE_DT);
-    if (amplitudeEncoderA != amplitudeEncoderB && (millis() - lastEncoderDebounce) > encoderDebounceTime) {
-        if (amplitudeEncoderA == LOW && signalPeakVoltage + 0.05 <= (MAX_DAC_VOLTAGE + 0.01)) {  // + 0.01 to account for inequality on 2.70 + 0.05 <= 2.75 due to floating precision
-            signalPeakVoltage += 0.05;
-        } else if (amplitudeEncoderB == LOW && signalPeakVoltage - 0.05 >= MIN_DAC_VOLTAGE) {
-            signalPeakVoltage -= 0.05;
+        // We don't want to re-compute waveform table during any switch press while in hold down mode, as output frequency can't change in hold down mode
+        if (!wasFreqHeldDown && freqLastButtonState == LOW && freqEncoderButtonState == HIGH && (millis() - lastEncoderDebounce) > buttonDebounceTime) {
+            outputFrequency = changedOutputFrequency;
+            generateDDSLookup();
+            Serial.println("reconstructed dds waveform from frequency change");
+            lastEncoderDebounce = millis();
         }
-        Serial.print("A: ");
-        Serial.print(amplitudeEncoderA);
-        Serial.print(" - B: ");
-        Serial.print(amplitudeEncoderB);
-        Serial.print("\tsignalPeakVoltage: ");
-        Serial.println(signalPeakVoltage);
-        lastEncoderDebounce = millis();
+        // Serial.print((millis() - holdDownStartTime) > buttonHoldTimeThreshold); // demonstrate in video
+        // Serial.print(" - ");
+        // Serial.println(wasHeldDown);
+        if (wasFreqHeldDown && freqLastButtonState == HIGH && freqEncoderButtonState == LOW) {
+            wasFreqHeldDown = false;         // Press switch again to disable hold down mode
+            lastEncoderDebounce = millis();  // re-enables debounce to prevent recomputing waveform after pressing switch to disable hold down mode
+        } else if (!wasFreqHeldDown && changedWaveformSelect != 2 && (millis() - freqHoldDownStartTime) > buttonHoldTimeThreshold) {
+            wasFreqHeldDown = true;                                               // only if square wave is not selected, and if switch is held down long enough, enable hold down mode
+            UIPages[1].getTextField(4)->setTextColor(lcd, ILI9341_UI_LIGHTBLUE);  // show user that they can now make changes to the frequency step
+        }
+        freqLastButtonState = freqEncoderButtonState;
+
+        int freqEncoderA = digitalRead(FREQ_RE_CLK), freqEncoderB = digitalRead(FREQ_RE_DT);
+        if (freqEncoderA != freqEncoderB && (millis() - lastEncoderDebounce) > encoderDebounceTime) {
+            if (wasFreqHeldDown && freqEncoderA == LOW) {                   // If in hold down mode, use pin A to increase frequency step
+                frequencyStep = pow(10, min(log10(frequencyStep) + 1, 5));  // Set frequency step to the next multiple of 10, up to 100,000
+            } else if (wasFreqHeldDown && freqEncoderB == LOW) {            // If in hold down mode, use pin B to decrease frequency step
+                frequencyStep = pow(10, log10(frequencyStep) - 1);          // Set frequency step to the previous multiple of 10, down until 1
+            } else if (freqEncoderA == LOW) {
+                changedOutputFrequency = min(changedOutputFrequency + frequencyStep, SAMPLING_RATE / 2);  // Increment output frequency by frequency step, up to SAMPLING_RATE / 2 (up to 500 KHz)
+            } else if (freqEncoderB == LOW && changedOutputFrequency - frequencyStep > 0) {
+                changedOutputFrequency -= frequencyStep;  // Decrement output frequency by frequency step, down until 1 Hz
+            }
+
+            if (wasFreqHeldDown) {
+                UIPages[1].getTextField(4)->setFormattedText(lcd, 20, ILI9341_WHITE, "Step: %.0f Hz", frequencyStep);  // %% escapes % for printf (i use vsnprintf in the method implementation)
+            } else {
+                bool useHz = changedOutputFrequency < 1000;
+                int floatPrecision = floor(changedOutputFrequency) < changedOutputFrequency ? 2 : 1;  // e.g. if changedOutputFrequency = 1000.5, then 1000.0 < 1000.5, so use 2 decimal places
+
+                // .* allows for variable floating point precision (https://cplusplus.com/reference/cstdio/printf/), defined by the argument preceding the argument to be formatted
+                UIPages[1].getTextField(3)->setFormattedText(lcd,
+                                                             22,
+                                                             changedOutputFrequency == outputFrequency ? ILI9341_WHITE : ILI9341_RED,
+                                                             "Frequency: %.*f %s",
+                                                             floatPrecision,  // sets precision of %.*f (either %.0f or %.2f in this case)
+                                                             useHz ? changedOutputFrequency : changedOutputFrequency / 1000.0,
+                                                             useHz ? "Hz" : "KHz");
+            }
+
+            // Serial.print("A: ");
+            // Serial.print(freqEncoderA);
+            // Serial.print(" - B: ");
+            // Serial.print(freqEncoderB);
+            // Serial.print("\tfreqStep: ");
+            // Serial.print(frequencyStep);
+            // Serial.print(" - outputFreq: ");
+            // Serial.println(changedOutputFrequency);
+            lastEncoderDebounce = millis();
+        }
+
+
+        // AMPL_RotaryEncoder functionality, controls peak voltage/amplitude of waveform in steps of 0.05 V (50 mV)
+        int amplEncoderButtonState = digitalRead(AMPL_RE_SW);
+        if (amplEncoderButtonState == HIGH) {
+            amplHoldDownStartTime = millis();
+        }
+
+        // moved up to set wasAmplHeldDown to false sooner because duty cycle change should trigger next if when hold down is disabled
+        if (wasAmplHeldDown && amplLastButtonState == HIGH && amplEncoderButtonState == LOW) {
+            wasAmplHeldDown = false;
+        } else if (!wasAmplHeldDown && changedWaveformSelect == 2 && (millis() - amplHoldDownStartTime) > buttonHoldTimeThreshold) {  // if square wave is selected, enable user to change duty cycle
+            wasAmplHeldDown = true;
+            UIPages[1].getTextField(4)->setTextColor(lcd, ILI9341_UI_LIGHTBLUE);
+        }
+
+        if (!wasAmplHeldDown && amplLastButtonState == LOW && amplEncoderButtonState == HIGH && (millis() - lastEncoderDebounce) > buttonDebounceTime) {
+            signalPeakVoltage = changedSignalPeakVoltage;
+            signalDutyCycle = fabs(changedSignalDutyCycle);
+            generateDDSLookup();
+            Serial.println("reconstructed dds waveform from peak amplitude change");
+            lastEncoderDebounce = millis();
+        }
+        amplLastButtonState = amplEncoderButtonState;
+
+        int amplEncoderA = digitalRead(AMPL_RE_CLK), amplEncoderB = digitalRead(AMPL_RE_DT);
+        if (amplEncoderA != amplEncoderB && (millis() - lastEncoderDebounce) > encoderDebounceTime) {
+            if (wasAmplHeldDown && amplEncoderA == LOW && changedSignalDutyCycle < 1) {
+                changedSignalDutyCycle += 0.01;
+            } else if (wasAmplHeldDown && amplEncoderB == LOW && changedSignalDutyCycle > 0) {
+                changedSignalDutyCycle -= 0.01;
+            } else if (amplEncoderA == LOW && changedSignalPeakVoltage + 0.05 <= (MAX_DAC_VOLTAGE + 0.01)) {  // + 0.01 to account for inequality on 2.70 + 0.05 <= 2.75 due to floating precision
+                changedSignalPeakVoltage += 0.05;
+            } else if (amplEncoderB == LOW && changedSignalPeakVoltage - 0.05 >= MIN_DAC_VOLTAGE) {
+                changedSignalPeakVoltage -= 0.05;
+            }
+
+            if (wasAmplHeldDown) {
+                UIPages[1].getTextField(4)->setFormattedText(lcd, 17, changedSignalDutyCycle == signalDutyCycle ? ILI9341_WHITE : ILI9341_RED, "Duty Cycle: %.0f%%", changedSignalDutyCycle * 100);
+                UIPages[1].getFrame(1)->render(lcd);
+            } else {
+                UIPages[1].getTextField(2)->setFormattedText(lcd, 18, changedSignalPeakVoltage == signalPeakVoltage ? ILI9341_WHITE : ILI9341_RED, "Amplitude: %.2f V", changedSignalPeakVoltage);
+            }
+            // Serial.print("A: ");
+            // Serial.print(amplEncoderA);
+            // Serial.print(" - B: ");
+            // Serial.print(amplEncoderB);
+            // Serial.print("\tsignalPeakVoltage: ");
+            // Serial.println(changedSignalPeakVoltage);
+            lastEncoderDebounce = millis();  // remove if not smooth
+        }
+
+        // WAVE_RotaryEncoder functionality, handles waveform shape selection (no hold down mode implemented for this encoder, as one is not needed for function generator)
+        int waveformEncoderButtonState = digitalRead(WAVE_RE_SW);
+        if (waveLastButtonState == LOW && waveformEncoderButtonState == HIGH && (millis() - lastEncoderDebounce) > buttonDebounceTime) {
+            waveformSelect = abs(changedWaveformSelect);
+            generateDDSLookup();
+            Serial.println("reconstructed dds waveform from changing waveform shape");
+            lastEncoderDebounce = millis();
+        }
+        waveLastButtonState = waveformEncoderButtonState;
+
+        int waveformEncoderA = digitalRead(WAVE_RE_CLK), waveformEncoderB = digitalRead(WAVE_RE_DT);
+        if (waveformEncoderA != waveformEncoderB && (millis() - lastEncoderDebounce) > encoderDebounceTime) {
+            // nice loop effect where it loops from 0 - 1 to 2 and 2 + 1 to 0, unfortunately must do it this way since C++ uses truncation modulos
+            changedWaveformSelect = ((changedWaveformSelect + (waveformEncoderA == LOW ? 1 : -1)) % 3 + 3) % 3;
+
+            // Re-render the waveform preview display, fires the onRender event for it too
+            UIPages[1].getFrame(1)->render(lcd);
+
+            lastEncoderDebounce = millis();
+        }
+    } else if (currentDisplayedPage == 0) {
+        // Implement rotary encoder functionality for oscilloscope here (cursor movement to influence measurement display, chaning volts/div and time/div, etc.)
     }
-
-    // WAVE_RotaryEncoder functionality, handles waveform shape selection
-    // int waveformEncoderButtonState = digitalRead(WAVE_RE_SW);
-    // if (waveformLastButtonState == LOW && waveformEncoderButtonState == HIGH && (millis() - lastEncoderDebounce) > buttonDebounceTime) {
-    //     generateDDSLookup();
-    //     Serial.println("reconstructed dds waveform from changing waveform shape");
-    //     lastEncoderDebounce = millis();
-    // }
-    // waveformLastButtonState = waveformEncoderButtonState;
-
-    // int waveformEncoderA = digitalRead(WAVE_RE_CLK), waveformEncoderB = digitalRead(WAVE_RE_DT);
-    // if (waveformEncoderA != waveformEncoderB && (millis() - lastEncoderDebounce) > encoderDebounceTime) {
-    //     if (waveformEncoderA == LOW && waveformSelect + 1 <= 2) {
-    //         waveformSelect++;
-    //     } else if (waveformEncoderB == LOW && waveformSelect - 1 >= 0) {
-    //         waveformSelect--;
-    //     }
-    //     lastEncoderDebounce = millis();
-    // }
 }
 
 void DACC_Handler() {
+    // TODO: Implement a big optimization that uses the symmetrical nature of periodic functions that will lead to a wider output frequency range, saving clock cycles, saving
+    // space in memory (would divide memory usage by 4), and allow for more defined and higher sample signals. This can be done by generating only a quarter of a sine wave and
+    // storing it in the lookup table and using simple logic to manipulate how the PDC accesses that lookup table to produce a full period sine wave (i.e, if phase is less than
+    // pi/2, output entire quarter wave, if phase is between pi/2 and pi, output entire quarter wave in reverse, if phase is between pi and 3pi/2, output entire inverted quarter
+    // wave, and if phase is between 3pi/2 and 2pi, output entire inverted quarter wave in reverse). Similar logic applies to triangle wave, but only half of triangle wave is
+    // stored and for the second half of the period (phase > pi), output triangle wave in reverse order. Essentially, figure out how to modify
+    // the contents of transmit buffer without doing much computation as that would slow down the ISR (which may not be a thing I have to worry about, since the frequency of the ISR
+    // itself has already been lowered a ton thanks to the PDC only triggering an interrupt whenever the transmit buffer is empty)
     if (DACC->DACC_ISR & DACC_ISR_TXBUFE) {
         DACC->DACC_TNPR = (uint32_t)ddsLookup;
         DACC->DACC_TNCR = ddsLookupSize;
@@ -622,6 +835,7 @@ void DACC_Handler() {
 
 void ADC_Handler() {
     if (ADC->ADC_ISR & ADC_ISR_ENDRX) {
+        // Enqueue to circular buffer is the first operation since we want to read previous buffer (ADC_RPR) while PDC is writing the next buffer
         circular_buffer_enqueue(circularADCBuffer, adcPingPongBuffer[swapReadWriteBuffer], ADC_BUFFER_SIZE);
         ADC->ADC_RNPR = (uint32_t)adcPingPongBuffer[swapReadWriteBuffer];
         ADC->ADC_RNCR = ADC_BUFFER_SIZE;

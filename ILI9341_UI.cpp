@@ -21,10 +21,10 @@ TS_Point convertTSCoords(Adafruit_ILI9341& lcd, TS_Point p) {
 
 
 Frame::Frame(unsigned int x, unsigned int y, unsigned int width, unsigned int height, uint16_t frameColor, uint16_t borderThickness, uint16_t borderColor)
-  : _x(x), _y(y), _width(width), _height(height), _frameColor(frameColor), _borderThickness(borderThickness), _borderColor(borderColor), _radius(0), _borderType(CircularBorderType::All) {}
+  : _x(x), _y(y), _width(width), _height(height), _frameColor(frameColor), _borderThickness(borderThickness), _borderColor(borderColor), _radius(0), _borderType(CircularBorderType::All), _onRenderCallback(nullptr) {}
 
 Frame::Frame(unsigned int x, unsigned int y, unsigned int width, unsigned int height, uint16_t frameColor, unsigned int radius, CircularBorderType borderType, uint16_t borderThickness, uint16_t borderColor)
-  : _x(x), _y(y), _width(width), _height(height), _frameColor(frameColor), _borderThickness(borderThickness), _borderColor(borderColor), _radius(radius), _borderType(borderType) {}
+  : _x(x), _y(y), _width(width), _height(height), _frameColor(frameColor), _borderThickness(borderThickness), _borderColor(borderColor), _radius(radius), _borderType(borderType), _onRenderCallback(nullptr) {}
 
 void Frame::setRadius(unsigned int radius, CircularBorderType borderType) {
     // _oldRadius = _radius;
@@ -47,6 +47,10 @@ void Frame::setBorderColor(uint16_t borderColor) {
 
 void Frame::setBorderThickness(uint16_t borderThickness) {
     _borderThickness = borderThickness;
+}
+
+void Frame::setOnRenderCallback(render_callback_t callback) {
+    _onRenderCallback = callback;
 }
 
 void Frame::render(Adafruit_ILI9341& lcd) {
@@ -97,6 +101,10 @@ void Frame::render(Adafruit_ILI9341& lcd) {
         }
         lcd.fillRect(_x, _y, _width, _height, _frameColor);
     }
+    
+    if (_onRenderCallback != nullptr) {
+        _onRenderCallback();
+    }
     _isRendered = true;
 }
 
@@ -110,19 +118,21 @@ void Frame::unrender(Adafruit_ILI9341& lcd, uint16_t backgroundColor) {
 
 
 
-TextField::TextField(unsigned int x, unsigned int y, unsigned int width, unsigned int height, char* text, uint16_t frameColor, uint16_t textColor, TextAlignment align, uint16_t borderThickness, uint16_t borderColor)
-  : Frame(x, y, width, height, frameColor, borderThickness, borderColor), _text(text), _textColor(textColor), _align(align), _textPaddingX(5), _textPaddingY(0) {}
+TextField::TextField(unsigned int x, unsigned int y, unsigned int width, unsigned int height, char text[100], uint16_t frameColor, uint16_t textColor, TextAlignment align, uint16_t borderThickness, uint16_t borderColor)
+  : Frame(x, y, width, height, frameColor, borderThickness, borderColor), _textColor(textColor), _align(align), _textPaddingX(5), _textPaddingY(0), _textChangedCallback(nullptr) {
+    strcpy(_text, text);
+  }
 
-TextField::TextField(unsigned int x, unsigned int y, unsigned int width, unsigned int height, char* text, uint16_t frameColor, unsigned int radius, CircularBorderType borderType, uint16_t textColor, TextAlignment align, uint16_t borderThickness, uint16_t borderColor)
-  : Frame(x, y, width, height, frameColor, radius, borderType, borderThickness, borderColor), _text(text), _textColor(textColor), _align(align), _textPaddingX(5), _textPaddingY(0) {}
+TextField::TextField(unsigned int x, unsigned int y, unsigned int width, unsigned int height, char text[100], uint16_t frameColor, unsigned int radius, CircularBorderType borderType, uint16_t textColor, TextAlignment align, uint16_t borderThickness, uint16_t borderColor)
+  : Frame(x, y, width, height, frameColor, radius, borderType, borderThickness, borderColor), _textColor(textColor), _align(align), _textPaddingX(5), _textPaddingY(0), _textChangedCallback(nullptr) {
+    strcpy(_text, text);
+  }
 
-void TextField::setText(Adafruit_ILI9341& lcd, const char* text, uint16_t textColor) {
+void TextField::setText(Adafruit_ILI9341& lcd, const char text[100], uint16_t textColor) {
     if (textColor > 0) {
         _textColor = textColor;
     }
-    Serial.print(_text);
-    Serial.print(" ");
-    Serial.println(text);
+
     if (_isRendered) {
         // Method may also be called to display different text color, not just different text
         if (strcmp(_text, text) != 0) {
@@ -130,6 +140,10 @@ void TextField::setText(Adafruit_ILI9341& lcd, const char* text, uint16_t textCo
             this->setAlignedCursor(lcd);
             lcd.setTextColor(_frameColor);
             lcd.println(_text);
+
+            if (_textChangedCallback != nullptr) {
+                _textChangedCallback(_text);
+            }
         }
 
         this->setAlignedCursor(lcd);
@@ -137,7 +151,23 @@ void TextField::setText(Adafruit_ILI9341& lcd, const char* text, uint16_t textCo
         lcd.println(text);
     }
     // Skip all the graphics displaying and just update internal text value since button isn't rendered
-    _text = strcpy(_text, text);
+    strcpy(_text, text);
+}
+
+// use textColor = 0 to avoid setting color
+void TextField::setFormattedText(Adafruit_ILI9341 &lcd, uint16_t size, uint16_t textColor, const char *text, ...) {
+    char textBuffer[size];
+
+    va_list args;
+    va_start(args, text);
+    vsnprintf(textBuffer, size, text, args);
+    va_end(args);
+
+    this->setText(lcd, textBuffer, textColor);
+}
+
+void TextField::setTextColor(Adafruit_ILI9341 &lcd, uint16_t textColor) {
+    this->setText(lcd, _text, textColor);
 }
 
 void TextField::setTextAlignment(Adafruit_ILI9341& lcd, TextAlignment align) {
@@ -196,6 +226,10 @@ void TextField::setAlignedCursor(Adafruit_ILI9341& lcd) {
     }
 }
 
+void TextField::setOnTextChangedCallback(text_callback_t callback) {
+    _textChangedCallback = callback;
+}
+
 const char* TextField::getText() {
     return this->_text;
 }
@@ -207,10 +241,10 @@ void TextField::render(Adafruit_ILI9341& lcd) {
 
 
 
-TextButton::TextButton(unsigned int x, unsigned int y, unsigned int width, unsigned int height, char* text, uint16_t frameColor, button_callback_t buttonPressedCallback, uint16_t textColor, TextAlignment align, uint16_t borderThickness, uint16_t borderColor)
+TextButton::TextButton(unsigned int x, unsigned int y, unsigned int width, unsigned int height, char text[100], uint16_t frameColor, button_callback_t buttonPressedCallback, uint16_t textColor, TextAlignment align, uint16_t borderThickness, uint16_t borderColor)
   : TextField(x, y, width, height, text, frameColor, textColor, align, borderThickness, borderColor), _buttonPressedCallback(buttonPressedCallback) {}
 
-TextButton::TextButton(unsigned int x, unsigned int y, unsigned int width, unsigned int height, char* text, uint16_t frameColor, button_callback_t buttonPressedCallback, unsigned int radius, CircularBorderType borderType, uint16_t textColor, TextAlignment align, uint16_t borderThickness, uint16_t borderColor)
+TextButton::TextButton(unsigned int x, unsigned int y, unsigned int width, unsigned int height, char text[100], uint16_t frameColor, button_callback_t buttonPressedCallback, unsigned int radius, CircularBorderType borderType, uint16_t textColor, TextAlignment align, uint16_t borderThickness, uint16_t borderColor)
   : TextField(x, y, width, height, text, frameColor, radius, borderType, textColor, align, borderThickness, borderColor), _buttonPressedCallback(buttonPressedCallback) {}
 
 bool TextButton::isPressed(TS_Point touchPoint) {
@@ -232,6 +266,8 @@ TextField* UIPage::getTextField(int textFieldIndex) {
 TextButton* UIPage::getTextButton(int textButtonIndex) {
     return &this->textButtons[textButtonIndex];
 }
+
+
 
 void UIPage::setElements(Frame *frames, TextField *textFields, TextButton *textButtons, int framesSize, int textFieldsSize, int textButtonsSize) {
     this->framesSize = framesSize;
