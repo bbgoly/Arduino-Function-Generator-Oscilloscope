@@ -14,7 +14,7 @@ bool circular_buffer_isEmpty(circular_buffer_t* cBuffer) {
 }
 
 bool circular_buffer_isFull(circular_buffer_t* cBuffer) {
-    return cBuffer->head + 1 == cBuffer->tail;
+    return cBuffer->head == 0;
 }
 
 void circular_buffer_clear(circular_buffer_t* cBuffer) {

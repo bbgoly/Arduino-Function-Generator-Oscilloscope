@@ -1,6 +1,12 @@
 /* Simple UI library for the ILI9341
  * By Yousif Kndkji
  *
+ * Features callbacks on button click events, render events, and text changed events
+ * Also has the ability to align text on the left, center, or right with padding 
+ * if needed, and can draw all-sided or one-sided circular UI elements on any side
+ * of a UI element with circular or non-circular borders as well. Also features a 
+ * container struct to store and keep track of all created UI elements.
+ * 
  * Uses the Adafruit graphics libraries for the ILI9341 and the XPT2046_Touchscreen
  * library by Paul Stoffregen (https://github.com/PaulStoffregen/XPT2046_Touchscreen)
  */
@@ -21,7 +27,7 @@
 #define ILI9341_UI_DARKGREEN 0x04E0
 #define ILI9341_UI_DARKRED 0x8800
 #define ILI9341_UI_DARKBLUE 0x0010
-#define ILI9341_UI_LIGHTBLUE 0xB6BF
+#define ILI9341_UI_LIGHTBLUE 0x34DF
 
 // Probably add corner border types like TopRight, BottomLeft, etc.
 enum TextAlignment { LeftAlign, RightAlign, CenterAlign };
