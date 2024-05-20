@@ -37,7 +37,7 @@ typedef void (*render_callback_t)();
 typedef void (*button_callback_t)(int);
 typedef void (*text_callback_t)(const char[100]);
 
-// Calibration values for touch screen derived from another program (under gen folder)
+// Calibration values for touch screen derived from another program (under test folder)
 const float xCalM = 0.09, xCalC = -19.88, yCalM = 0.07, yCalC = -21.17;
 
 TS_Point convertTSCoords(Adafruit_ILI9341& lcd, TS_Point p);

@@ -7,13 +7,12 @@ circular_buffer_t* circular_buffer_init(unsigned int maxSize) {
     return cBuffer;
 }
 
-// https://www.youtube.com/watch?v=-5rAjOjTGtc&list=RDouUeRx0OHPw&index=27
-
 bool circular_buffer_isEmpty(circular_buffer_t* cBuffer) {
     return cBuffer->head == cBuffer->tail;
 }
 
 bool circular_buffer_isFull(circular_buffer_t* cBuffer) {
+    // probably test (cBuffer->head == 0 && cBuffer->tail != 0) || cBuffer->head + 1 == cBuffer->tail; to cover both array enqueue/dequeue and one by one enqueue/dequeue
     return cBuffer->head == 0;
 }
 
@@ -24,7 +23,7 @@ void circular_buffer_clear(circular_buffer_t* cBuffer) {
 
 int circular_buffer_enqueue(circular_buffer_t* cBuffer, uint16_t data) {
     int nextPosition = (cBuffer->head + 1) & (cBuffer->maxSize - 1);  // assumes maxSize is power of 2
-    if (nextPosition == cBuffer->tail) return -1;
+    if (nextPosition == cBuffer->tail) return -1; // if buffer full
 
     cBuffer->buffer[cBuffer->head] = data;
     cBuffer->head = nextPosition;
@@ -38,7 +37,7 @@ void circular_buffer_enqueue(circular_buffer_t* cBuffer, uint16_t data[], unsign
 }
 
 int16_t circular_buffer_dequeue(circular_buffer_t* cBuffer) {
-    if (cBuffer->head == cBuffer->tail) return -1;
+    if (cBuffer->head == cBuffer->tail) return -1; // if buffer empty
 
     uint16_t data = cBuffer->buffer[cBuffer->tail];
     cBuffer->tail = (cBuffer->tail + 1) & (cBuffer->maxSize - 1);

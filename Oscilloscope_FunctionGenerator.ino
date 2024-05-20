@@ -45,7 +45,7 @@
 #define WAVE_RE_DT 11
 #define WAVE_RE_CLK 12
 
-// #define SD_ADC_DATA_FILE "RECENT_OSCILLOSCOPE_DATA.csv" // can have multiple files by changing this name, may make it possible to change in ui n future
+// #define SD_ADC_DATA_FILE "RECENT_OSCILLOSCOPE_DATA.csv" // can have multiple files by changing this name, may make it possible to change in ui in future and have multiple files
 
 constexpr float SAMPLING_RATE = 1000000.0;
 constexpr uint16_t LOOKUP_SIZE = 8192;  // 2^14 8192 16384
@@ -130,6 +130,8 @@ int buttonDebounceTime = 300;
 int buttonHoldTimeThreshold = 500;
 uint32_t lastEncoderDebounce = 0;
 
+// generate new lookup table using DDS (for sine/triangle waves) each time a function generator parameter change is confirmed
+// essentially, calculate once, use as long as desired
 void generateDDSLookup() {
     // waveformSelect = 0 => sine wave
     // waveformSelect = 1 => triangle wave
@@ -140,18 +142,18 @@ void generateDDSLookup() {
     waveformSelect = abs(changedWaveformSelect);
 
     float voltageRatio = signalPeakVoltage / MAX_DAC_VOLTAGE;
-    ddsLookupSize = SAMPLING_RATE / outputFrequency;  // size is number of times tuning word can go into 32 bits, so size = 2^32 / tuningWord = Fs / Fout
+    ddsLookupSize = SAMPLING_RATE / outputFrequency;  // size is number of times binary tuning word can go into 32 bits, so size = 2^32 / tuningWord = Fs / Fout
     if (waveformSelect == 2) {
-        int highPeriodMax = (float)ddsLookupSize * signalDutyCycle;
+        int highPeriodMax = (float)ddsLookupSize * signalDutyCycle; // determine how long square wave should stay HIGH based on duty cycle before dropping to LOW
         for (int i = 0; i < ddsLookupSize; i++) {
             ddsLookup[i] = i < highPeriodMax ? (voltageRatio * 0xFFF) : 0;
         }
     } else {
         tuningWord = pow(2, 32) * outputFrequency / SAMPLING_RATE;
         for (int i = 0; i < ddsLookupSize; i++) {
-            uint32_t phaseIncrement = phaseAccumulator >> (32 - lookupWidth);
-            ddsLookup[i] = voltageRatio * waveformLookupTables[waveformSelect][phaseIncrement];
-            phaseAccumulator += tuningWord;
+            uint32_t phaseIncrement = phaseAccumulator >> (32 - lookupWidth);                    // convert phase to lookup table index
+            ddsLookup[i] = voltageRatio * waveformLookupTables[waveformSelect][phaseIncrement];  // convert phase to corresponding point (digital amplitude) in signal waveform and reduce amplitude by ratio of desired voltage by maximum dac voltage
+            phaseAccumulator += tuningWord;                                                      // calculate next phase shift using binary tuning word
         }
     }
 
@@ -621,6 +623,7 @@ void setup() {
         waveformLookupTables[1][i] = (uint16_t)(4095.0 * (1.0 - fabs(2.0 * i / LOOKUP_SIZE - 1.0)));
     }
 
+    // removed since waste of memory
     // Generate square wave lookup table with default duty cycle of 50%
     // for (int i = 0; i < LOOKUP_SIZE; i++) {
     //     waveformLookupTables[2][i] = i < LOOKUP_SIZE * signalDutyCycle ? 0xFFF : 0;
@@ -663,7 +666,6 @@ void loop() {
         // DMA batch of data from ADC to SD card over SPI to permanently save collected data,
         // and will continue to send data left in buffer until empty even if oscilloscope isnt
         // enabled
-
         // adcDataCSV.write(adcDataBatch, ADC_BUFFER_SIZE * sizeof(uint16_t));
 
         // Being able to write to an SD card, if one is available, will allow users
@@ -679,8 +681,8 @@ void loop() {
         // cleanly setup the boundaries of the graph.
         if (oscilloscopeEnabled && currentDisplayedPage == 0) {
             uint16_t maxADCValue = 0;
-            uint16_t waveStartY = lcd.height() - OSCIL_GRAPH_HEIGHT_OFFSET - 1;  // 208;
-            uint16_t waveHeight = waveStartY - OSCIL_GRAPH_START_Y - 1;          // - 37;
+            const uint16_t waveStartY = lcd.height() - OSCIL_GRAPH_HEIGHT_OFFSET - 1;  // 208;
+            const uint16_t waveHeight = waveStartY - OSCIL_GRAPH_START_Y - 1;          // - 37;
             const float waveSlopeX = ((float)lcd.width()) / ADC_BUFFER_SIZE, waveSlopeY = (float)waveHeight / (ADC_VOLTAGE_RANGE * ANALOG_DIGITAL_CONVERSION_RATIO);
             lcd.fillRect(0, 37, lcd.width(), waveHeight, ILI9341_BLACK);  // 38
             for (int i = 1; i < 7; i++) {
@@ -696,12 +698,6 @@ void loop() {
                     lcd.fillRect(floor(i * waveSlopeX + 0.5), waveStartY - adcData * waveSlopeY, 1, 1, ILI9341_ORANGE);
                 }
 
-                // Comment the LCD stuff and uncomment only the next 3 lines to see ADC signal - prints a batch of adc data to view in serial plotter,
-                // should display a clean 512 sample waveform, and if connected to a low pass filter with a cutoff frequency of 500 KHz, it should
-                // display a very clean, connected, no jitter, waveform
-                // Serial.print("0, ");
-                // Serial.println(adcData);
-                // Serial.println(", 4095");
                 if (adcData > maxADCValue) {
                     maxADCValue = adcData;
                 }
@@ -752,9 +748,7 @@ void loop() {
             Serial.println("reconstructed dds waveform from frequency change");
             lastEncoderDebounce = millis();
         }
-        // Serial.print((millis() - holdDownStartTime) > buttonHoldTimeThreshold); // demonstrate in video
-        // Serial.print(" - ");
-        // Serial.println(wasHeldDown);
+
         if (wasFreqHeldDown && freqLastButtonState == HIGH && freqEncoderButtonState == LOW) {
             wasFreqHeldDown = false;  // Press switch again to disable hold down mode
             UIPages[1].getTextField(4)->setTextColor(lcd, ILI9341_WHITE);
@@ -871,15 +865,25 @@ void DACC_Handler() {
     // stored and for the second half of the period (phase > pi), output triangle wave in reverse order. Essentially, figure out how to modify
     // the contents of transmit buffer without doing much computation as that would slow down the ISR (which may not be a thing I have to worry about, since the frequency of the ISR
     // itself has already been lowered a ton thanks to the PDC only triggering an interrupt whenever the transmit buffer is empty)
-    if (DACC->DACC_ISR & DACC_ISR_TXBUFE) {
+
+    // Check transmit buffer empty flag, if true then TCR (the transmit counter register) and TCNR (transmit next counter register) have
+    // both reached zero, meaning that there is no remaining data in PDC transmit buffer and the last remaining data was transferred to
+    // target peripheral memory (the DAC's memory). Therefore, we load the next registers with a pointer to the next transmit buffer
+    // and the size of the next transmit buffer
+    if (DACC->DACC_ISR & DACC_ISR_TXBUFE) { // redundant check since interrupt is only generated when TXBUFE flag is set, but wont hurt as a safety check
         DACC->DACC_TNPR = (uint32_t)ddsLookup;
         DACC->DACC_TNCR = ddsLookupSize;
     }
 }
 
 void ADC_Handler() {
+    // If current PDC receive buffers are full (RCR = 0), then receive buffer turns from a write buffer to a read buffer and the buffer is enqueued into
+    // the larger circular buffer. At the same time, since as soon as RCR reaches zero RPR is loaded with RNPR, that means the other half of the ping pong
+    // buffer is being written to with ADC conversions, so the buffer we are currently reading should also be set as the next write buffer once we are 
+    // done reading it (aka swap ping pong buffer), which is done by setting RNPR to point to the next receive buffer (next write buffer, aka the buffer we just read)
     if (ADC->ADC_ISR & ADC_ISR_ENDRX) {
-        // Enqueue to circular buffer is the first operation since we want to read previous buffer (ADC_RPR) while PDC is writing the next buffer
+        // Enqueue to circular buffer is the first operation since we want to read previous buffer (what was previously ADC_RPR) while PDC is writing
+        // the next buffer with ADC conversions (what is now ADC_RPR = ADC_RNPR), then we set new ADC_RNPR to prepare for next ADC_RCR = 0
         circular_buffer_enqueue(circularADCBuffer, adcPingPongBuffer[swapReadWriteBuffer], ADC_BUFFER_SIZE);
         ADC->ADC_RNPR = (uint32_t)adcPingPongBuffer[swapReadWriteBuffer];
         ADC->ADC_RNCR = ADC_BUFFER_SIZE;

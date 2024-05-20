@@ -1,5 +1,7 @@
 #include "ILI9341_UI.h"
 
+// Converts touchscreen coordinates to pixel coordinates within the resolution of LCD
+// using pre-calculated calibration values
 TS_Point convertTSCoords(Adafruit_ILI9341& lcd, TS_Point p) {
     int16_t xCoord = round(p.x * xCalM + xCalC);
     int16_t yCoord = round(p.y * yCalM + yCalC);
@@ -55,9 +57,11 @@ void Frame::setOnRenderCallback(render_callback_t callback) {
 
 void Frame::render(Adafruit_ILI9341& lcd) {
     if (_radius > 0) {
-        uint16_t boundaryOffset = min(5 * _radius, _width / 2);
+        uint16_t boundaryOffset = min(5 * _radius, _width / 2); // probably rewrite to be more accurate with a boundaryOffsetY too
         switch (_borderType) {
             case Top:
+                // didnt feel like wasting time figuring out how to add a circular border to this case, especially since I don't even use this case
+                // will add in future if I decide to use ILI9341 for other projects (aka if I decide to expand on this UI library)
                 lcd.fillRoundRect(_x, _y, _width, boundaryOffset, _radius, _frameColor);
                 lcd.fillRect(_x, _y + boundaryOffset / 2, _width, _height - boundaryOffset / 2, _frameColor);
                 break;
@@ -74,6 +78,7 @@ void Frame::render(Adafruit_ILI9341& lcd) {
                     lcd.fillRoundRect(_x - _borderThickness, _y - _borderThickness, boundaryOffset, _height + 2*_borderThickness, _radius, _borderColor);
                     lcd.fillRect(_x - _borderThickness + boundaryOffset / 2, _y - _borderThickness, _width - boundaryOffset / 2 + _borderThickness, _height + 2*_borderThickness, _borderColor);
                 }
+                // test stuff - creates wireframe representation of how everything would look, to check if the math is correct
                 // lcd.drawRect(_x, _y, _width, _height, ILI9341_WHITE);
                 // lcd.drawRoundRect(_x, _y, boundaryOffset, _height, _radius, _frameColor);
                 // lcd.drawRect(_x + boundaryOffset / 2, _y, _width - boundaryOffset / 2 - _borderThickness, _height, _frameColor);
@@ -102,6 +107,7 @@ void Frame::render(Adafruit_ILI9341& lcd) {
         lcd.fillRect(_x, _y, _width, _height, _frameColor);
     }
     
+    // if current component has onRender event binded to a callback
     if (_onRenderCallback != nullptr) {
         _onRenderCallback();
     }
@@ -141,6 +147,7 @@ void TextField::setText(Adafruit_ILI9341& lcd, const char text[100], uint16_t te
             lcd.setTextColor(_frameColor);
             lcd.println(_text);
 
+            // if text component has textChanged event binded to a callback
             if (_textChangedCallback != nullptr) {
                 _textChangedCallback(_text);
             }
@@ -154,7 +161,7 @@ void TextField::setText(Adafruit_ILI9341& lcd, const char text[100], uint16_t te
     strcpy(_text, text);
 }
 
-// use textColor = 0 to avoid setting color
+// use textColor = 0 to avoid setting color if not needed (see TextField::setText)
 void TextField::setFormattedText(Adafruit_ILI9341 &lcd, uint16_t size, uint16_t textColor, const char *text, ...) {
     char textBuffer[size];
 
@@ -255,6 +262,8 @@ void TextButton::executeCallback(int sourceButtonIndex) {
     _buttonPressedCallback(sourceButtonIndex);
 }
 
+
+
 Frame* UIPage::getFrame(int frameIndex) {
     return &this->frames[frameIndex];
 }
@@ -266,8 +275,6 @@ TextField* UIPage::getTextField(int textFieldIndex) {
 TextButton* UIPage::getTextButton(int textButtonIndex) {
     return &this->textButtons[textButtonIndex];
 }
-
-
 
 void UIPage::setElements(Frame *frames, TextField *textFields, TextButton *textButtons, int framesSize, int textFieldsSize, int textButtonsSize) {
     this->framesSize = framesSize;
