@@ -126,7 +126,7 @@ uint32_t lastTouchTime = 0;
 
 // General rotary encoder variables
 int encoderDebounceTime = 50;
-int buttonDebounceTime = 300;
+int buttonDebounceTime = 400;
 int buttonHoldTimeThreshold = 500;
 uint32_t lastEncoderDebounce = 0;
 
@@ -144,7 +144,8 @@ void generateDDSLookup() {
     float voltageRatio = signalPeakVoltage / MAX_DAC_VOLTAGE;
     ddsLookupSize = SAMPLING_RATE / outputFrequency;  // size is number of times binary tuning word can go into 32 bits, so size = 2^32 / tuningWord = Fs / Fout
     if (waveformSelect == 2) {
-        int highPeriodMax = (float)ddsLookupSize * signalDutyCycle; // determine how long square wave should stay HIGH based on duty cycle before dropping to LOW
+        // determine how long square wave should stay HIGH based on duty cycle before dropping to LOW, + 0.001 to fix floating precision error without adding much error to actual value
+        int highPeriodMax = (float)ddsLookupSize * (signalDutyCycle + 0.001);
         for (int i = 0; i < ddsLookupSize; i++) {
             ddsLookup[i] = i < highPeriodMax ? (voltageRatio * 0xFFF) : 0;
         }
@@ -162,6 +163,8 @@ void generateDDSLookup() {
     UIPages[1].getTextField(2)->setTextColor(lcd, ILI9341_WHITE);
     UIPages[1].getTextField(3)->setTextColor(lcd, ILI9341_WHITE);
     UIPages[1].getTextField(4)->setTextColor(lcd, ILI9341_WHITE);
+
+    UIPages[1].getTextField(0)->setFormattedText(lcd, 35, 0, "Status: %.2f KHz @ %d samples", outputFrequency / 1000, ddsLookupSize);
 }
 
 void setupTCDACC() {
@@ -317,7 +320,6 @@ void switchUIPage(int sourceButtonIndex) {
 }
 
 void toggleOscilloscope(int sourceButtonIndex) {
-    Serial.println("disambled");
     TextButton* toggleADCButton = UIPages[currentDisplayedPage].getTextButton(sourceButtonIndex);
     toggleADCButton->unrender(lcd, ILI9341_BLACK);
     if (oscilloscopeEnabled) {
@@ -475,7 +477,10 @@ void displayWaveformPreview() {
             for (int i = 0; i < WAVEFORM_PREVIEW_SAMPLE_SIZE; i++) {
                 lcd.fillRect(waveStartX + 2 * i, waveStartY + 40 * sin(2.0 * PI * (float)i / WAVEFORM_PREVIEW_SAMPLE_SIZE), 2, 2, ILI9341_WHITE);
             }
-            UIPages[1].getTextField(4)->setFormattedText(lcd, 20, 0, "Step: %.0f Hz", frequencyStep);
+            UIPages[1].getTextField(4)->setFormattedText(lcd, 20, ILI9341_WHITE, "Step: %.*f Hz", floor(frequencyStep) < frequencyStep ? 2 : 0, frequencyStep);
+
+            // If previous waveform displayed was square wave and we didn't confirm changes to duty cycle before switching to another waveform, then reset it to what it was before changes
+            changedSignalDutyCycle = signalDutyCycle;
             break;
         case 1:  // triangle wave
             snprintf(waveformText, 19, "Waveform: Triangle");
@@ -483,24 +488,26 @@ void displayWaveformPreview() {
                 float xCoord = (float)(i) / WAVEFORM_PREVIEW_SAMPLE_SIZE;
                 lcd.fillRect(waveStartX + 2 * i, waveStartY - 40 * (2.0 * fabs(xCoord - floor(xCoord + 0.5)) - 0.5), 2, 2, ILI9341_WHITE);
             }
-            UIPages[1].getTextField(4)->setFormattedText(lcd, 20, 0, "Step: %.0f Hz", frequencyStep);
+            UIPages[1].getTextField(4)->setFormattedText(lcd, 20, ILI9341_WHITE, "Step: %.*f Hz", floor(frequencyStep) < frequencyStep ? 2 : 0, frequencyStep);
+            changedSignalDutyCycle = signalDutyCycle;
             break;
         case 2:  // square wave
             snprintf(waveformText, 17, "Waveform: Square");
             bool prevState = true;
-            Serial.println(fabs(changedSignalDutyCycle));
-            int highPeriodMax = WAVEFORM_PREVIEW_SAMPLE_SIZE * (fabs(changedSignalDutyCycle) + 0.01);
-            Serial.println(fabs(highPeriodMax));
+            int highPeriodMax = WAVEFORM_PREVIEW_SAMPLE_SIZE * (changedSignalDutyCycle + 0.001);
             for (int i = 0; i < WAVEFORM_PREVIEW_SAMPLE_SIZE; i++) {
                 bool waveState = i < highPeriodMax;
                 int16_t samplePosX = waveStartX + 2 * i, samplePosY = 20 * (waveState ? 1 : -1);
-                if (prevState != waveState) {
+                if (highPeriodMax != 0 && prevState != waveState) {
                     lcd.drawFastVLine(samplePosX, waveStartY + samplePosY, 40, ILI9341_WHITE);
                 }
                 lcd.fillRect(samplePosX, waveStartY - samplePosY, 2, 2, ILI9341_WHITE);
                 prevState = waveState;
             }
-            UIPages[1].getTextField(4)->setFormattedText(lcd, 17, 0, "Duty Cycle: %.0f%%", changedSignalDutyCycle * 100);
+
+            if (!wasAmplHeldDown) {
+                UIPages[1].getTextField(4)->setFormattedText(lcd, 17, ILI9341_WHITE, "Duty Cycle: %.0f%%", changedSignalDutyCycle * 100);
+            }
             break;
     }
     UIPages[1].getTextField(1)->setText(lcd, waveformText, changedWaveformSelect == waveformSelect ? ILI9341_WHITE : ILI9341_RED);  // Change color to that waveform selection was changed and will be applied if confirmed
@@ -555,7 +562,6 @@ void initLCD() {
         TextField(30, 120, 0, 20, "Frequency: 1 KHz", ILI9341_UI_DARKBLUE, ILI9341_WHITE, TextAlignment::LeftAlign),
         TextField(30, 140, 0, 20, "Step: 100 Hz", ILI9341_UI_DARKBLUE, ILI9341_WHITE, TextAlignment::LeftAlign)
     };
-    funcTextFields[0].setFormattedText(lcd, 35, 0, "Status: %.2f MHz @ %d samples", SAMPLING_RATE / 1.0e6, LOOKUP_SIZE);
 
     // change to func gen stuff
     TextButton* funcTextButtons = new TextButton[4]{
@@ -601,7 +607,7 @@ void setup() {
     lookupWidth = log2(LOOKUP_SIZE);
 
     signalPeakVoltage = MAX_DAC_VOLTAGE;
-    outputFrequency = 1000;
+    outputFrequency = 1100;
     signalDutyCycle = 0.5;
     waveformSelect = 0;
 
@@ -761,10 +767,10 @@ void loop() {
 
         int freqEncoderA = digitalRead(FREQ_RE_CLK), freqEncoderB = digitalRead(FREQ_RE_DT);
         if (freqEncoderA != freqEncoderB && (millis() - lastEncoderDebounce) > encoderDebounceTime) {
-            if (wasFreqHeldDown && freqEncoderA == LOW) {                   // If in hold down mode, use pin A to increase frequency step
-                frequencyStep = pow(10, min(log10(frequencyStep) + 1, 5));  // Set frequency step to the next multiple of 10, up to 100,000
-            } else if (wasFreqHeldDown && freqEncoderB == LOW) {            // If in hold down mode, use pin B to decrease frequency step
-                frequencyStep = pow(10, log10(frequencyStep) - 1);          // Set frequency step to the previous multiple of 10, down until 1
+            if (wasFreqHeldDown && freqEncoderA == LOW) {                      // If in hold down mode, use pin A to increase frequency step
+                frequencyStep = pow(10, min(log10(frequencyStep) + 1, 5));     // Set frequency step to the next multiple of 10, up to 100,000
+            } else if (wasFreqHeldDown && freqEncoderB == LOW) {               // If in hold down mode, use pin B to decrease frequency step
+                frequencyStep = max(pow(10, log10(frequencyStep) - 1), 0.01);  // Set frequency step to the previous multiple of 10, down until 0.01
             } else if (freqEncoderA == LOW) {
                 changedOutputFrequency = min(changedOutputFrequency + frequencyStep, SAMPLING_RATE / 2);  // Increment output frequency by frequency step, up to SAMPLING_RATE / 2 (up to 500 KHz)
             } else if (freqEncoderB == LOW && changedOutputFrequency - frequencyStep > 0) {
@@ -772,17 +778,18 @@ void loop() {
             }
 
             if (wasFreqHeldDown) {
-                UIPages[1].getTextField(4)->setFormattedText(lcd, 20, ILI9341_UI_LIGHTBLUE, "Step: %.0f Hz", frequencyStep);  // %% escapes % for printf (i use vsnprintf in the method implementation)
+                int stepFloatPrecision = floor(frequencyStep) < frequencyStep ? 2 : 0;
+                UIPages[1].getTextField(4)->setFormattedText(lcd, 20, ILI9341_UI_LIGHTBLUE, "Step: %.*f Hz", stepFloatPrecision, frequencyStep);
             } else {
                 bool useHz = changedOutputFrequency < 1000;
-                int floatPrecision = floor(changedOutputFrequency) < changedOutputFrequency ? 2 : 1;  // e.g. if changedOutputFrequency = 1000.5, then 1000.0 < 1000.5, so use 2 decimal places
+                int freqFloatPrecision = floor(changedOutputFrequency) < changedOutputFrequency ? 2 : 1;  // e.g. if changedOutputFrequency = 1000.5, then 1000.0 < 1000.5, so use 2 decimal places
 
                 // .* allows for variable floating point precision (https://cplusplus.com/reference/cstdio/printf/), defined by the argument preceding the argument to be formatted
                 UIPages[1].getTextField(3)->setFormattedText(lcd,
                                                              22,
                                                              changedOutputFrequency == outputFrequency ? ILI9341_WHITE : ILI9341_RED,
                                                              "Frequency: %.*f %s",
-                                                             floatPrecision,  // sets precision of %.*f (either %.0f or %.2f in this case)
+                                                             freqFloatPrecision,  // sets precision of %.*f (either %.0f or %.2f in this case)
                                                              useHz ? changedOutputFrequency : changedOutputFrequency / 1000.0,
                                                              useHz ? "Hz" : "KHz");
             }
@@ -815,7 +822,7 @@ void loop() {
         if (amplEncoderA != amplEncoderB && (millis() - lastEncoderDebounce) > encoderDebounceTime) {
             if (wasAmplHeldDown && amplEncoderA == LOW && changedSignalDutyCycle + 0.01 < 1) {
                 changedSignalDutyCycle += 0.01;
-            } else if (wasAmplHeldDown && amplEncoderB == LOW && changedSignalDutyCycle > 0) {
+            } else if (wasAmplHeldDown && amplEncoderB == LOW && changedSignalDutyCycle - 0.01 >= 0) {
                 changedSignalDutyCycle -= 0.01;
             } else if (amplEncoderA == LOW && changedSignalPeakVoltage + 0.05 <= (MAX_DAC_VOLTAGE + 0.01)) {  // + 0.01 to account for inequality on 2.70 + 0.05 <= 2.75 due to floating precision
                 changedSignalPeakVoltage += 0.05;
@@ -845,6 +852,8 @@ void loop() {
         if (waveformEncoderA != waveformEncoderB && (millis() - lastEncoderDebounce) > encoderDebounceTime) {
             // nice loop effect where it loops from 0 - 1 to 2 and 2 + 1 to 0, unfortunately must do it this way since C++ uses truncation modulos
             changedWaveformSelect = ((changedWaveformSelect + (waveformEncoderA == LOW ? 1 : -1)) % 3 + 3) % 3;
+            wasAmplHeldDown = false;
+            wasFreqHeldDown = false;
 
             // Re-render the waveform preview display, fires the onRender event for it too
             UIPages[1].getFrame(1)->render(lcd);
@@ -870,7 +879,7 @@ void DACC_Handler() {
     // both reached zero, meaning that there is no remaining data in PDC transmit buffer and the last remaining data was transferred to
     // target peripheral memory (the DAC's memory). Therefore, we load the next registers with a pointer to the next transmit buffer
     // and the size of the next transmit buffer
-    if (DACC->DACC_ISR & DACC_ISR_TXBUFE) { // redundant check since interrupt is only generated when TXBUFE flag is set, but wont hurt as a safety check
+    if (DACC->DACC_ISR & DACC_ISR_TXBUFE) {  // redundant check since interrupt is only generated when TXBUFE flag is set, but wont hurt as a safety check
         DACC->DACC_TNPR = (uint32_t)ddsLookup;
         DACC->DACC_TNCR = ddsLookupSize;
     }
@@ -879,7 +888,7 @@ void DACC_Handler() {
 void ADC_Handler() {
     // If current PDC receive buffers are full (RCR = 0), then receive buffer turns from a write buffer to a read buffer and the buffer is enqueued into
     // the larger circular buffer. At the same time, since as soon as RCR reaches zero RPR is loaded with RNPR, that means the other half of the ping pong
-    // buffer is being written to with ADC conversions, so the buffer we are currently reading should also be set as the next write buffer once we are 
+    // buffer is being written to with ADC conversions, so the buffer we are currently reading should also be set as the next write buffer once we are
     // done reading it (aka swap ping pong buffer), which is done by setting RNPR to point to the next receive buffer (next write buffer, aka the buffer we just read)
     if (ADC->ADC_ISR & ADC_ISR_ENDRX) {
         // Enqueue to circular buffer is the first operation since we want to read previous buffer (what was previously ADC_RPR) while PDC is writing
