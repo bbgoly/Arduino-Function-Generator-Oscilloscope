@@ -168,24 +168,26 @@ void generateDDSLookup() {
 }
 
 void setupTCDACC() {
-    // To supply the clock of the DACC and trigger it externally, we can generate PWM pulses through TIOA2
+    // To create a clock that will externally trigger DACC conversions, we can generate PWM pulses through TIOA2
     // (Timer Channel 2 on I/O Line A) using an internal clock. According to the block diagram in the datasheet,
     // to generate PWM pulses through TIOA2 we would need to enable and power on Timer Counter 0 (TC0) Channel 2
     // (which is TC2) in the power management controller.
     pmc_enable_periph_clk(ID_TC2);
 
     // Set channel to operate on Waveform mode, which configures TIOA to be an output (this allows us to
-    // generate PWM pulses to supply the DACC with a clock)
+    // generate PWM pulses to supply a clock for DACC conversions)
     TC0->TC_CHANNEL[2].TC_CMR = TC_CMR_TCCLKS_TIMER_CLOCK1  // Use MCK / 2 as clock signal (84 MHz / 2 = 42 MHz)
                                 | TC_CMR_WAVE               // Set channel operating mode to Waveform (to generate PWM and set TIOA as an output)
                                 | TC_CMR_WAVSEL_UP_RC       // Set TC to increment an internal counter (TC_CV) from 0 to RC and automatically generate
                                                             // a software trigger on RC compare and reset the counter back to 0
-                                | TC_CMR_ACPA_CLEAR         // Clear TIOA2 on RA compare to effectively create a duty cycle
-                                | TC_CMR_ACPC_SET;          // Set TIOA2 on RC compare
+                                | TC_CMR_ACPA_SET           // Set TIOA2 on RA compare to trigger DAC conversion
+                                | TC_CMR_ACPC_CLEAR;        // Clear TIOA2 on RC compare, this 
 
     // Set compare register C to 42 MHz divided by the sampling rate, meaning a software trigger would generate
     // SAMPLING_RATE times. e.g. SAMPLING_RATE = 1 MHz, therefore RC = 42, so the counter would increment up to
     // 42 1 million times, generating a constant 1 MHz clock to trigger our DAC conversions on each rising edge.
+    // To create a PWM signal that can be used to drive DAC conversions, setting register A to half register C
+    // effectively creates a duty cycle of 50%, where TIOA2 is set HIGH at counter = 21 and held until counter = 42
     TC0->TC_CHANNEL[2].TC_RC = VARIANT_MCK / 2 / SAMPLING_RATE;  // TC_RC = MCK / 2 / Frequency = 84 MHz / 2 / 1 MHz = 42
     TC0->TC_CHANNEL[2].TC_RA = TC0->TC_CHANNEL[2].TC_RC / 2;     // 50% duty cycle
 
@@ -244,8 +246,8 @@ void setupTCADC() {
     TC0->TC_CHANNEL[1].TC_CMR = TC_CMR_TCCLKS_TIMER_CLOCK1
                                 | TC_CMR_WAVE
                                 | TC_CMR_WAVSEL_UP_RC
-                                | TC_CMR_ACPA_CLEAR
-                                | TC_CMR_ACPC_SET;
+                                | TC_CMR_ACPA_SET
+                                | TC_CMR_ACPC_CLEAR;
 
     TC0->TC_CHANNEL[1].TC_RC = VARIANT_MCK / 2 / SAMPLING_RATE;
     TC0->TC_CHANNEL[1].TC_RA = TC0->TC_CHANNEL[1].TC_RC / 2;
@@ -498,7 +500,7 @@ void displayWaveformPreview() {
             for (int i = 0; i < WAVEFORM_PREVIEW_SAMPLE_SIZE; i++) {
                 bool waveState = i < highPeriodMax;
                 int16_t samplePosX = waveStartX + 2 * i, samplePosY = 20 * (waveState ? 1 : -1);
-                if (highPeriodMax != 0 && prevState != waveState) {
+                if (prevState != waveState) {
                     lcd.drawFastVLine(samplePosX, waveStartY + samplePosY, 40, ILI9341_WHITE);
                 }
                 lcd.fillRect(samplePosX, waveStartY - samplePosY, 2, 2, ILI9341_WHITE);
