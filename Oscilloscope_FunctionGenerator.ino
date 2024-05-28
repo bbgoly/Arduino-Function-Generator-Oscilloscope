@@ -500,7 +500,7 @@ void displayWaveformPreview() {
             for (int i = 0; i < WAVEFORM_PREVIEW_SAMPLE_SIZE; i++) {
                 bool waveState = i < highPeriodMax;
                 int16_t samplePosX = waveStartX + 2 * i, samplePosY = 20 * (waveState ? 1 : -1);
-                if (prevState != waveState) {
+                if (highPeriodMax != 0 && prevState != waveState) {
                     lcd.drawFastVLine(samplePosX, waveStartY + samplePosY, 40, ILI9341_WHITE);
                 }
                 lcd.fillRect(samplePosX, waveStartY - samplePosY, 2, 2, ILI9341_WHITE);
@@ -710,6 +710,8 @@ void loop() {
                     maxADCValue = adcData;
                 }
             }
+            // Todo: Improve voltage measurement in future by likely using a larger batch of adc values to determine peak voltage,
+            // as low duty cycle square waves can make the voltage measurement jump between peak amplitude and lowest amplitude
             UIPages[0].getTextField(1)->setFormattedText(lcd, 7, 0, "%.2f V", maxADCValue * ADC_VOLTAGE_RANGE / pow(2, 12));  // Voltage = AnalogValue * (Vref+ - Vref-)/2^n
 
             // double freq = 1.0e6 / (double)(timeElapsed - micros()); // not valid method
