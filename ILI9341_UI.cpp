@@ -241,6 +241,10 @@ const char* TextField::getText() {
     return this->_text;
 }
 
+const uint16_t TextField::getTextColor() {
+    return this->_textColor;
+}
+
 void TextField::render(Adafruit_ILI9341& lcd) {
     Frame::render(lcd);
     this->setText(lcd, _text);

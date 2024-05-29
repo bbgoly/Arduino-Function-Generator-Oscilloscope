@@ -82,6 +82,7 @@ class TextField : public Frame {
     void setOnTextChangedCallback(text_callback_t callback);
 
     const char* getText();
+    const uint16_t getTextColor();
 
     void render(Adafruit_ILI9341& lcd);
 
