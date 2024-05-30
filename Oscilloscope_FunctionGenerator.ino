@@ -31,7 +31,7 @@
 #define TFT_CS 28
 #define TFT_DC 26
 #define T_CS 40
-#define SD_CS 23
+// #define SD_CS 23
 
 #define FREQ_RE_SW 4
 #define FREQ_RE_DT 5
@@ -47,14 +47,18 @@
 
 // #define SD_ADC_DATA_FILE "RECENT_OSCILLOSCOPE_DATA.csv" // can have multiple files by changing this name, may make it possible to change in ui in future and have multiple files
 
+// DAC constants
 constexpr float SAMPLING_RATE = 1000000.0;
-constexpr uint16_t LOOKUP_SIZE = 16384;  // 2^14 8192 16384
+constexpr uint16_t LOOKUP_SIZE = pow(2, 13);  // essentially the precision of waveform data, recommended to be +1 or +2 higher than resolution of DAC
+constexpr uint64_t MAX_UINT32_VALUE = pow(2, 32);
+constexpr float DDS_FREQUENCY_RESOLUTION = SAMPLING_RATE / MAX_UINT32_VALUE;  // precision of DDS, represents the smallest possible change in output frequency that is possible with DDS setup
+
+// ADC constants
 constexpr uint16_t ADC_BUFFER_SIZE = 512;
 constexpr uint16_t ADC_CIRCULAR_BUFFER_SIZE = pow(2, 13);
 constexpr uint8_t WAVEFORM_PREVIEW_SAMPLE_SIZE = 50;
 constexpr uint16_t OSCIL_GRAPH_START_Y = 36;
 constexpr uint16_t OSCIL_GRAPH_HEIGHT_OFFSET = 31;
-constexpr uint64_t MAX_UINT32_VALUE = pow(2, 32);
 
 // The range of voltages that the DAC on the Arduino Due can output according to datasheet
 constexpr float MAX_DAC_VOLTAGE = 2.75;
@@ -67,25 +71,25 @@ constexpr float ANALOG_DIGITAL_CONVERSION_RATIO = (pow(2, 12) - 1) / ADC_VOLTAGE
 
 // Function generator variables
 // uint16_t waveformLookupTables[2][LOOKUP_SIZE];
-uint16_t waveformLookupTable[LOOKUP_SIZE];
+uint16_t waveformLookupTable[LOOKUP_SIZE];  // either declare as volatile or use ping pong... try volatile first
 
 float signalPeakVoltage;
 float outputFrequency;
 float signalDutyCycle;  // Considered for square waves only
 int8_t waveformSelect;
 
+uint8_t lookupWidth;
+
 volatile float voltageRatio;
 
 volatile uint32_t tuningWord;
-uint32_t phaseAccumulator;
-uint8_t lookupWidth;
+uint32_t phaseAccumulator;  // This and next two variables don't have to be volatile since they only change within ISR
 
-uint16_t ddsLookupSize;
-uint16_t ddsLookupBuffer[2][LOOKUP_SIZE];  // Ping pong double buffer
-volatile bool swapDACReadWriteBuffer = false;
+uint16_t ddsLookupBuffer[2][LOOKUP_SIZE]; // Ping pong double buffer
+bool swapDACReadWriteBuffer = false;      // change to dds
 
 bool functionGenEnabled = true;
-bool functionGenCH1Enabled = false;
+bool functionGenCH1Enabled = false;  // DAC0 unfortunately doesn't work
 bool functionGenCH2Enabled = true;
 
 // Function generator related rotary encoder variables
@@ -108,7 +112,7 @@ int waveLastButtonState = HIGH;
 
 // Oscilloscope variables
 uint16_t adcPingPongBuffer[2][ADC_BUFFER_SIZE];  // Ping pong double buffer
-volatile bool swapADCReadWriteBuffer = false;
+bool swapADCReadWriteBuffer = false;             // doesnt need to be volatile since only used within ISR
 
 circular_buffer_t* circularADCBuffer;
 
@@ -136,9 +140,31 @@ int buttonDebounceTime = 400;
 int buttonHoldTimeThreshold = 500;
 uint32_t lastEncoderDebounce = 0;
 
+// Waveform lookup table data generation
+void generateDDSLookup() {
+    // determine how long square wave (if selected) should stay HIGH based on duty cycle before dropping to LOW, + 0.001 to fix floating precision error
+    // without adding much error to actual value itself
+    int highPeriodMax = (float)LOOKUP_SIZE * (signalDutyCycle + 0.001);
+    for (int i = 0; i < LOOKUP_SIZE; i++) {
+        switch (waveformSelect) {
+            case 0: // => sine wave
+                waveformLookupTable[i] = (uint16_t)roundf(2047.0 * (sin(2.0 * PI * (float)i / LOOKUP_SIZE) + 1.0));
+                break;
+            case 1: // => triangle wave
+                waveformLookupTable[i] = (uint16_t)(4095.0 * (1.0 - fabs(2.0 * i / LOOKUP_SIZE - 1.0)));
+                break;
+            case 2: // => square wave
+                waveformLookupTable[i] = i < highPeriodMax ? 0xFFF : 0;  // might have to change algorithm
+                break;
+        }
+    }
+    Serial.print("Generated lookup data for waveform ");
+    Serial.print(waveformSelect);
+}
+
 // generate new lookup table using DDS (for sine/triangle waves) each time a function generator parameter change is confirmed
 // essentially, calculate once, use as long as desired
-void generateDDSLookup() {
+void setWaveformParameters() {
     outputFrequency = changedOutputFrequency;
     signalPeakVoltage = changedSignalPeakVoltage;
 
@@ -147,38 +173,19 @@ void generateDDSLookup() {
     tuningWord = MAX_UINT32_VALUE * outputFrequency / SAMPLING_RATE;
     voltageRatio = (signalPeakVoltage - MIN_DAC_VOLTAGE) / DAC_VOLTAGE_RANGE;
 
-    TextField* dutyCycleTextField = UIPages[1].getTextField(4);
-
+    // test, if good, then remove
     // checking text color is a safer version of signalDutyCycle != changedSignalDutyCycle, since duty cycle is a float equality checks are unreliable
     // essentially, only re-generate the lookup table if any change need to be applied to the waveform lookup data itself, such as when the selected
     // waveform to output changes, we must generate the data for it, or if the duty cycle of the generating square wave is changing, then adjust the
     // number of HIGHs accordingly (will only be true if square wave is selected anyways).
-    if (waveformSelect != changedWaveformSelect || (changedWaveformSelect == 2 && dutyCycleTextField->getTextColor() == ILI9341_RED)) {
+
+    // skip waveform lookup table generation if nothing related to waveform data itself was changed
+    // (this is a huge optimization when changing only frequency or voltage for example)
+    if (waveformSelect != changedWaveformSelect || signalDutyCycle != changedSignalDutyCycle) {
         signalDutyCycle = changedSignalDutyCycle;
         waveformSelect = abs(changedWaveformSelect);
-
-        // determine how long square wave (if selected) should stay HIGH based on duty cycle before dropping to LOW, + 0.001 to fix floating precision error
-        // without adding much error to actual value itself
-        int highPeriodMax = (float)LOOKUP_SIZE * (signalDutyCycle + 0.001);
-        for (int i = 0; i < LOOKUP_SIZE; i++) {
-            // waveformSelect = 0 => sine wave
-            // waveformSelect = 1 => triangle wave
-            // waveformSelect = 2 => square wave
-            switch (waveformSelect) {
-                case 0:
-                    waveformLookupTable[i] = (uint16_t)roundf(2047.0 * (sin(2.0 * PI * (float)i / LOOKUP_SIZE) + 1.0));
-                    break;
-                case 1:
-                    waveformLookupTable[i] = (uint16_t)(4095.0 * (1.0 - fabs(2.0 * i / LOOKUP_SIZE - 1.0)));
-                    break;
-                case 2:
-                    waveformLookupTable[i] = i < highPeriodMax ? 0xFFF : 0;
-                    break;
-            }
-        }
+        generateDDSLookup();
     }
-
-    ddsLookupSize = ceil(SAMPLING_RATE / outputFrequency);  // size is number of times binary tuning word can go into 32 bits, so size = 2^32 / tuningWord = Fs / Fout
 
     // Change text colors back to default to show user that change was confirmed and applied
     UIPages[1].getTextField(1)->setTextColor(lcd, ILI9341_WHITE);
@@ -186,10 +193,11 @@ void generateDDSLookup() {
     UIPages[1].getTextField(3)->setTextColor(lcd, ILI9341_WHITE);
     UIPages[1].getTextField(4)->setTextColor(lcd, ILI9341_WHITE);
 
-    UIPages[1].getTextField(0)->setFormattedText(lcd, 35, 0, "Status: %.2f KHz @ %d samples", outputFrequency / 1000, ddsLookupSize);
+    // size is number of times binary tuning word can go into 32 bits, so size = 2^32 / tuningWord = Fs / Fout
+    UIPages[1].getTextField(0)->setFormattedText(lcd, 35, 0, "Status: %.2f KHz @ %.0f samples", outputFrequency / 1000, ceil(SAMPLING_RATE / outputFrequency));
 }
 
-void populateDDSDMABuffer() {
+void computeDDSDMABuffer() {
     for (int i = 0; i < LOOKUP_SIZE; i++) {
         uint32_t phaseIncrement = phaseAccumulator >> (32 - lookupWidth);                                 // convert phase to lookup table index
         ddsLookupBuffer[swapDACReadWriteBuffer][i] = voltageRatio * waveformLookupTable[phaseIncrement];  // convert phase to corresponding point (digital amplitude) in signal waveform and reduce amplitude by ratio of desired voltage by maximum dac voltage
@@ -261,12 +269,12 @@ void setupDACC() {
     DACC->DACC_CHER = DACC_CHER_CH1;  // For dual-channel, use DACC_CHER_CH0 | DACC_CHER_CH1 instead
 
     // DAC PDC DMA setup
-    DACC->DACC_IER = DACC_IER_TXBUFE;             // Set DACC interrupt to trigger when DMA transmit buffer is empty
-    DACC->DACC_TPR = (uint32_t)ddsLookupBuffer;   // Set pointer to first transmit buffer
-    DACC->DACC_TCR = LOOKUP_SIZE;                 // Set size of transmit buffer
-    DACC->DACC_TNPR = (uint32_t)ddsLookupBuffer;  // Set pointer to second transmit buffer
-    DACC->DACC_TNCR = LOOKUP_SIZE;                // Set size of next transmit buffer
-    DACC->DACC_PTCR = DACC_PTCR_TXTEN;            // Enables half-duplex PDC transmit channel requests for DACC
+    DACC->DACC_IER = DACC_IER_TXBUFE;                // Set DACC interrupt to trigger when DMA transmit buffer is empty
+    DACC->DACC_TPR = (uint32_t)ddsLookupBuffer[0];   // Set pointer to first transmit buffer in ping pong buffer
+    DACC->DACC_TCR = LOOKUP_SIZE;                    // Set size of transmit buffer
+    DACC->DACC_TNPR = (uint32_t)ddsLookupBuffer[1];  // Set pointer to second transmit buffer in ping pong buffer
+    DACC->DACC_TNCR = LOOKUP_SIZE;                   // Set size of next transmit buffer
+    DACC->DACC_PTCR = DACC_PTCR_TXTEN;               // Enables half-duplex PDC transmit channel requests for DACC
 }
 
 void setupTCADC() {
@@ -344,8 +352,10 @@ void setupADCC() {
     ADC->ADC_PTCR = ADC_PTCR_RXTEN;                  // Enables half-duplex PDC receive channel requests for ADCC
 }
 
-// Text button callbacks, when text button is touched on LCD, one of these callback functions are invoked
+// Text button callbacks section, when text button is touched on LCD, one of these callback functions are invoked
+
 // Callbacks for oscilloscope UI
+
 void switchUIPage(int sourceButtonIndex) {
     UIPages[currentDisplayedPage].unrenderAll(lcd, ILI9341_BLACK);
     currentDisplayedPage = (currentDisplayedPage + 1) & 1;
@@ -460,6 +470,7 @@ void toggleDACChannel1(int sourceButtonIndex) {
     toggleDACCH1Button->setText(lcd, "DAC0: N/A");  // DAC0 not working, see setupDACC
 
     // The code below would be how this method would have been implemented if my DAC0 was working
+
     // toggleDACCH1Button->unrender(lcd, ILI9341_BLACK);
     // if (DACC->DACC_CHSR & DACC_CHSR_CH0) {
     //     toggleDACCH1Button->setFrameColor(ILI9341_RED);
@@ -501,11 +512,12 @@ void toggleDACChannel2(int sourceButtonIndex) {
 }
 
 // Callbacks for function generator UI
+
 void displayWaveformPreview() {
     char waveformText[19];
     uint16_t waveStartX = lcd.width() / 2 + 20, waveStartY = lcd.height() / 2;
     switch (abs(changedWaveformSelect)) {
-        case 0:  // sine wave
+        case 0: // => sine wave
             snprintf(waveformText, 15, "Waveform: Sine");
             for (int i = 0; i < WAVEFORM_PREVIEW_SAMPLE_SIZE; i++) {
                 lcd.fillRect(waveStartX + 2 * i, waveStartY + 40 * sin(2.0 * PI * (float)i / WAVEFORM_PREVIEW_SAMPLE_SIZE), 2, 2, ILI9341_WHITE);
@@ -515,7 +527,7 @@ void displayWaveformPreview() {
             // If previous waveform displayed was square wave and we didn't confirm changes to duty cycle before switching to another waveform, then reset it to what it was before changes
             changedSignalDutyCycle = signalDutyCycle;
             break;
-        case 1:  // triangle wave
+        case 1: // => triangle wave
             snprintf(waveformText, 19, "Waveform: Triangle");
             for (int i = 0; i < WAVEFORM_PREVIEW_SAMPLE_SIZE; i++) {
                 float xCoord = (float)(i) / WAVEFORM_PREVIEW_SAMPLE_SIZE;
@@ -524,7 +536,7 @@ void displayWaveformPreview() {
             UIPages[1].getTextField(4)->setFormattedText(lcd, 20, ILI9341_WHITE, "Step: %.*f Hz", floor(frequencyStep) < frequencyStep ? 2 : 0, frequencyStep);
             changedSignalDutyCycle = signalDutyCycle;
             break;
-        case 2:  // square wave
+        case 2: // => square wave
             snprintf(waveformText, 17, "Waveform: Square");
             bool prevState = true;
             int highPeriodMax = WAVEFORM_PREVIEW_SAMPLE_SIZE * (changedSignalDutyCycle + 0.001);
@@ -618,8 +630,6 @@ void initLCD() {
 //     adcDataCSV.open(SD_ADC_DATA_FILE, O_CREAT | O_WRONLY); // creates file if doesnt exist and opens for writing only
 // }
 
-uint32_t freqTestTime = 0;
-
 void setup() {
     Serial.begin(9600);
 
@@ -655,29 +665,12 @@ void setup() {
 
     initLCD();
 
-    // old methods of generating lookup table for variable lookup size (cleaner and saves having to manually fill table)
-
-    // Generate sine wave lookup table
-    // for (int i = 0; i < LOOKUP_SIZE; i++) {
-    //     waveformLookupTables[0][i] = (uint16_t)roundf(2047.0 * (sin(2.0 * PI * (float)i / LOOKUP_SIZE) + 1.0));
-    // }
-
-    // // Generate triangle wave lookup table
-    // for (int i = 0; i < LOOKUP_SIZE; i++) {
-    //     waveformLookupTables[1][i] = (uint16_t)(4095.0 * (1.0 - fabs(2.0 * i / LOOKUP_SIZE - 1.0)));
-    // }
-
-    // removed since waste of memory
-    // Generate square wave lookup table with default duty cycle of 50%
-    // for (int i = 0; i < LOOKUP_SIZE; i++) {
-    //     waveformLookupTables[2][i] = i < LOOKUP_SIZE * signalDutyCycle ? 0xFFF : 0;
-    // }
     generateDDSLookup();
+    computeDDSDMABuffer(); // populate first dds buffer for first dma transmit
+    computeDDSDMABuffer(); // populate second dds buffer for second dma transmit
 
     Serial.print("\nTuning word: ");
     Serial.println(tuningWord);
-    Serial.print("DDS lookup table size: ");
-    Serial.println(ddsLookupSize);
 
     // Disable register write protection in the power management controller
     pmc_set_writeprotect(false);
@@ -695,7 +688,6 @@ void setup() {
 
     lastTouchTime = millis();
     lastEncoderDebounce = millis();
-    freqTestTime = millis();
 
     circular_buffer_clear(circularADCBuffer);
 }
@@ -726,10 +718,10 @@ void loop() {
         // cleanly setup the boundaries of the graph.
         if (oscilloscopeEnabled && currentDisplayedPage == 0) {
             uint16_t maxADCValue = 0;
-            const uint16_t waveStartY = lcd.height() - OSCIL_GRAPH_HEIGHT_OFFSET - 1;  // 208;
-            const uint16_t waveHeight = waveStartY - OSCIL_GRAPH_START_Y - 1;          // - 37;
+            const uint16_t waveStartY = lcd.height() - OSCIL_GRAPH_HEIGHT_OFFSET - 1;
+            const uint16_t waveHeight = waveStartY - OSCIL_GRAPH_START_Y - 1;
             const float waveSlopeX = ((float)lcd.width()) / ADC_BUFFER_SIZE, waveSlopeY = (float)waveHeight / (ADC_VOLTAGE_RANGE * ANALOG_DIGITAL_CONVERSION_RATIO);
-            lcd.fillRect(0, 37, lcd.width(), waveHeight, ILI9341_BLACK);  // 38
+            lcd.fillRect(0, 37, lcd.width(), waveHeight, ILI9341_BLACK);
             for (int i = 1; i < 7; i++) {
                 lcd.drawFastHLine(0, waveStartY - 26 * i, lcd.width(), ILI9341_DARKGREY);
             }
@@ -737,7 +729,7 @@ void loop() {
             for (int i = 0; i < ADC_BUFFER_SIZE; i++) {
                 uint8_t adcChannel = adcDataBatch[i] >> 12;
                 uint16_t adcData = adcDataBatch[i] & 0xFFF;
-                if (adcChannel == 7) {
+                if (adcChannel == 7) { // use ADC_CHSR_CH7?
                     lcd.fillRect(floor(i * waveSlopeX + 0.5), waveStartY - adcData * waveSlopeY, 1, 1, ILI9341_WHITE);
                 } else if (adcChannel == 6) {
                     lcd.fillRect(floor(i * waveSlopeX + 0.5), waveStartY - adcData * waveSlopeY, 1, 1, ILI9341_ORANGE);
@@ -749,7 +741,8 @@ void loop() {
             }
             // Todo: Improve voltage measurement in future by likely using a larger batch of adc values to determine peak voltage,
             // as low duty cycle square waves can make the voltage measurement jump between peak amplitude and lowest amplitude
-            UIPages[0].getTextField(1)->setFormattedText(lcd, 7, 0, "%.2f V", maxADCValue * ADC_VOLTAGE_RANGE / pow(2, 12));  // Voltage = AnalogValue * (Vref+ - Vref-)/2^n
+            // Voltage = AnalogValue * (Vref+ - Vref-)/2^n
+            UIPages[0].getTextField(1)->setFormattedText(lcd, 7, 0, "%.2f V", maxADCValue * ADC_VOLTAGE_RANGE / pow(2, 12));
 
             // double freq = 1.0e6 / (double)(timeElapsed - micros()); // not valid method
             // UIPages[0].getTextField(2)->setFormattedText(lcd, 9, "%.1f %s", freq >= 1000.0 ? freq / 1000.0 : freq, freq >= 1000.0 ? "KHz" : "Hz");
@@ -791,9 +784,8 @@ void loop() {
 
         // We don't want to re-compute waveform table during any switch press while in hold down mode, as output frequency can't change in hold down mode
         if (!wasFreqHeldDown && functionGenEnabled && freqLastButtonState == LOW && freqEncoderButtonState == HIGH && (millis() - lastEncoderDebounce) > buttonDebounceTime) {
-            // skip waveform lookup table generation since we only changed frequency (which only affects DDS, this is a huge optimization when changing only frequency)
-            populateDDSDMABuffer();
-            Serial.println("reconstructed dds waveform from frequency change");
+            setWaveformParameters();
+            Serial.println("configured dds waveform parameters from frequency change");
             lastEncoderDebounce = millis();
         }
 
@@ -815,8 +807,8 @@ void loop() {
                 frequencyStep = max(pow(10, log10(frequencyStep) - 1), 0.01);  // Set frequency step to the previous multiple of 10, down until 0.01
             } else if (freqEncoderA == LOW) {
                 changedOutputFrequency = min(changedOutputFrequency + frequencyStep, SAMPLING_RATE / 2);  // Increment output frequency by frequency step, up to SAMPLING_RATE / 2 (up to 500 KHz)
-            } else if (freqEncoderB == LOW && changedOutputFrequency - frequencyStep > 0) {
-                changedOutputFrequency -= frequencyStep;  // Decrement output frequency by frequency step, down until 1 Hz
+            } else if (freqEncoderB == LOW && changedOutputFrequency - frequencyStep > DDS_FREQUENCY_RESOLUTION) {
+                changedOutputFrequency -= frequencyStep;  // Decrement output frequency by frequency step, down until before the smallest possible frequency with DDS setup
             }
 
             if (wasFreqHeldDown) {
@@ -854,8 +846,8 @@ void loop() {
         }
 
         if (!wasAmplHeldDown && functionGenEnabled && amplLastButtonState == LOW && amplEncoderButtonState == HIGH && (millis() - lastEncoderDebounce) > buttonDebounceTime) {
-            generateDDSLookup();
-            Serial.println("reconstructed dds waveform from peak amplitude/duty cycle change");
+            setWaveformParameters();
+            Serial.println("reconstructed or configured dds waveform from peak amplitude/duty cycle change");
             lastEncoderDebounce = millis();
         }
         amplLastButtonState = amplEncoderButtonState;
@@ -884,7 +876,7 @@ void loop() {
         // WAVE_RotaryEncoder functionality, handles waveform shape selection (no hold down mode implemented for this encoder, as one is not needed for function generator)
         int waveformEncoderButtonState = digitalRead(WAVE_RE_SW);
         if (functionGenEnabled && waveLastButtonState == LOW && waveformEncoderButtonState == HIGH && (millis() - lastEncoderDebounce) > buttonDebounceTime) {
-            generateDDSLookup();
+            setWaveformParameters();
             Serial.println("reconstructed dds waveform from changing waveform shape");
             lastEncoderDebounce = millis();
         }
@@ -922,9 +914,9 @@ void DACC_Handler() {
     // target peripheral memory (the DAC's memory). Therefore, we load the next registers with a pointer to the next transmit buffer
     // and the size of the next transmit buffer
     if (DACC->DACC_ISR & DACC_ISR_TXBUFE) {  // redundant check since interrupt is only generated when TXBUFE flag is set, but wont hurt as a safety check
-        DACC->DACC_TNPR = (uint32_t)ddsLookupBuffer;
+        DACC->DACC_TNPR = (uint32_t)ddsLookupBuffer[swapDACReadWriteBuffer];
         DACC->DACC_TNCR = LOOKUP_SIZE;
-        populateDDSDMABuffer();
+        computeDDSDMABuffer();
     }
 }
 
