@@ -85,7 +85,7 @@ float voltageRatio;
 volatile uint32_t tuningWord;
 uint32_t phaseAccumulator;  // This and next two variables don't have to be volatile since they only change within ISR
 
-uint16_t ddsLookupBuffer[2][LOOKUP_SIZE]; // Ping pong double buffer
+uint16_t ddsLookupBuffer[2][LOOKUP_SIZE];  // Ping pong double buffer
 // uint16_t ddsLookupBuffer[LOOKUP_SIZE];
 bool swapDACReadWriteBuffer = false;  // change to dds
 
@@ -154,8 +154,9 @@ void generateDDSLookup() {
             case 1:  // => triangle wave
                 waveformLookupTable[i] = voltageRatio * (4095.0 * (1.0 - fabs(2.0 * i / LOOKUP_SIZE - 1.0)));
                 break;
-            case 2:                                                                     // => square wave
-                waveformLookupTable[i] = i < highPeriodMax ? voltageRatio * 0xFFF : 0;  // might have to change algorithm
+            case 2:  // => square wave
+                // might have to change algorithm
+                waveformLookupTable[i] = i < highPeriodMax && highPeriodMax != 0 ? voltageRatio * 0xFFF : 0;
                 break;
         }
     }
@@ -167,25 +168,20 @@ void generateDDSLookup() {
 // essentially, calculate once, use as long as desired
 void setWaveformParameters() {
     outputFrequency = changedOutputFrequency;
-    signalPeakVoltage = changedSignalPeakVoltage;
 
     // For calculations, we need to consider output voltage in terms of DAC voltage range instead, therefore
     // use 0 to 2.20 internally and externally display internal voltage value as plus 0.55 V (aka 0.55 V to 2.75 V)
     Serial.println(outputFrequency);
     tuningWord = MAX_UINT32_VALUE * outputFrequency / SAMPLING_RATE;
 
-    // test, if good, then remove
-    // checking text color is a safer version of signalDutyCycle != changedSignalDutyCycle, since duty cycle is a float equality checks are unreliable
-    // essentially, only re-generate the lookup table if any change need to be applied to the waveform lookup data itself, such as when the selected
-    // waveform to output changes, we must generate the data for it, or if the duty cycle of the generating square wave is changing, then adjust the
-    // number of HIGHs accordingly (will only be true if square wave is selected anyways).
-
     // skip waveform lookup table generation if nothing related to waveform data itself was changed
     // (this is a huge optimization when changing only frequency or voltage for example)
     if (waveformSelect != changedWaveformSelect || signalPeakVoltage != changedSignalPeakVoltage || signalDutyCycle != changedSignalDutyCycle) {
-        voltageRatio = (signalPeakVoltage - MIN_DAC_VOLTAGE) / DAC_VOLTAGE_RANGE;
+        signalPeakVoltage = changedSignalPeakVoltage;
         waveformSelect = abs(changedWaveformSelect);
         signalDutyCycle = changedSignalDutyCycle;
+
+        voltageRatio = (signalPeakVoltage - MIN_DAC_VOLTAGE) / DAC_VOLTAGE_RANGE;
         generateDDSLookup();
     }
 
@@ -201,9 +197,9 @@ void setWaveformParameters() {
 
 void computeDDSDMABuffer() {
     for (int i = 0; i < LOOKUP_SIZE; i++) {
-        uint32_t phaseIncrement = phaseAccumulator >> (32 - lookupWidth);  // convert phase to lookup table index
-        ddsLookupBuffer[swapDACReadWriteBuffer][i] = waveformLookupTable[phaseIncrement];          // convert phase to corresponding point (digital amplitude) in signal waveform and reduce amplitude by ratio of desired voltage by maximum dac voltage
-        phaseAccumulator += tuningWord;                                    // calculate next phase shift using binary tuning word
+        uint32_t phaseIncrement = phaseAccumulator >> (32 - lookupWidth);                  // convert phase to lookup table index
+        ddsLookupBuffer[swapDACReadWriteBuffer][i] = waveformLookupTable[phaseIncrement];  // convert phase to corresponding point (digital amplitude) in signal waveform and reduce amplitude by ratio of desired voltage by maximum dac voltage
+        phaseAccumulator += tuningWord;                                                    // calculate next phase shift using binary tuning word
     }
     swapDACReadWriteBuffer = !swapDACReadWriteBuffer;
 }
@@ -221,8 +217,8 @@ void setupTCDACC() {
                                 | TC_CMR_WAVE               // Set channel operating mode to Waveform (to generate PWM and set TIOA as an output)
                                 | TC_CMR_WAVSEL_UP_RC       // Set TC to increment an internal counter (TC_CV) from 0 to RC and automatically generate
                                                             // a software trigger on RC compare and reset the counter back to 0
-                                | TC_CMR_ACPA_CLEAR         // Set TIOA2 on RA compare to trigger DAC conversion
-                                | TC_CMR_ACPC_SET;          // Clear TIOA2 on RC compare, this
+                                | TC_CMR_ACPA_CLEAR         // Clear TIOA2 on RA compare
+                                | TC_CMR_ACPC_SET;          // Set TIOA2 on RC compare
 
     // Set compare register C to 42 MHz divided by the sampling rate, meaning a software trigger would generate
     // SAMPLING_RATE times. e.g. SAMPLING_RATE = 1 MHz, therefore RC = 42, so the counter would increment up to
@@ -271,12 +267,12 @@ void setupDACC() {
     DACC->DACC_CHER = DACC_CHER_CH1;  // For dual-channel, use DACC_CHER_CH0 | DACC_CHER_CH1 instead
 
     // DAC PDC DMA setup
-    DACC->DACC_IER = DACC_IER_TXBUFE;             // Set DACC interrupt to trigger when DMA transmit buffer is empty
+    DACC->DACC_IER = DACC_IER_TXBUFE;                // Set DACC interrupt to trigger when DMA transmit buffer is empty
     DACC->DACC_TPR = (uint32_t)ddsLookupBuffer[0];   // Set pointer to first transmit buffer in ping pong buffer
-    DACC->DACC_TCR = LOOKUP_SIZE;                 // Set size of transmit buffer
+    DACC->DACC_TCR = LOOKUP_SIZE;                    // Set size of transmit buffer
     DACC->DACC_TNPR = (uint32_t)ddsLookupBuffer[1];  // Set pointer to second transmit buffer in ping pong buffer
-    DACC->DACC_TNCR = LOOKUP_SIZE;                // Set size of next transmit buffer
-    DACC->DACC_PTCR = DACC_PTCR_TXTEN;            // Enables half-duplex PDC transmit channel requests for DACC
+    DACC->DACC_TNCR = LOOKUP_SIZE;                   // Set size of next transmit buffer
+    DACC->DACC_PTCR = DACC_PTCR_TXTEN;               // Enables half-duplex PDC transmit channel requests for DACC
 }
 
 void setupTCADC() {
@@ -606,7 +602,7 @@ void initLCD() {
         TextField(0, 0, 210, 25, "", ILI9341_BLUE, 15, CircularBorderType::Right, ILI9341_WHITE, TextAlignment::LeftAlign, 5, ILI9341_UI_DARKBLUE),
         TextField(30, 80, 0, 20, "Waveform: Sine", ILI9341_UI_DARKBLUE, ILI9341_WHITE, TextAlignment::LeftAlign),
         TextField(30, 100, 0, 20, "Amplitude: 2.75 V", ILI9341_UI_DARKBLUE, ILI9341_WHITE, TextAlignment::LeftAlign),
-        TextField(30, 120, 0, 20, "Frequency: 1.1 KHz", ILI9341_UI_DARKBLUE, ILI9341_WHITE, TextAlignment::LeftAlign),
+        TextField(30, 120, 0, 20, "Frequency: 1 KHz", ILI9341_UI_DARKBLUE, ILI9341_WHITE, TextAlignment::LeftAlign),
         TextField(30, 140, 0, 20, "Step: 100 Hz", ILI9341_UI_DARKBLUE, ILI9341_WHITE, TextAlignment::LeftAlign)
     };
 
@@ -655,7 +651,7 @@ void setup() {
     // variables used to preview changes in function generator paramters for ui and rotary encoders
     // changing these variables will change actual function generator parameters when confirmed using setWaveformParameters()
     changedSignalPeakVoltage = MAX_DAC_VOLTAGE;
-    changedOutputFrequency = 1100;
+    changedOutputFrequency = 1000;
     changedSignalDutyCycle = 0.5;
     changedWaveformSelect = 0;
     frequencyStep = 100;
