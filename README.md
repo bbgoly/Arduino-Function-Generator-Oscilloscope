@@ -7,6 +7,6 @@ This project makes use of three public libraries each under a MIT or BSD license
 
 The SdFat library used is the same library used in the backend of Arduino's standard SD library, but a newer version of it to support exFAT MicroSDXC cards (which is what I am using).
 
-As for the Adafruit graphics libraries, they are used to run the ILI9341 driver on the TFT LCD I have, and the XPT2046_Touchscreen library is used to interface with the XPT2046 touchscreen IC that comes on the breakout board of the TFT LCD I am using.
+As for the Adafruit graphics libraries, they are used to run the ILI9341 driver on the TFT LCD I have, and the XPT2046_Touchscreen library is used to interface with the XPT2046 touchscreen IC that comes on the breakout board of the TFT LCD I am using. I also extended the libraries to create a UI framework for the ILI9341 and XPT2046.
 
-Most of the code has been explained with comments, to save readers from having to consult the datasheet as much to understand the code.
+Most of the code has been explained with comments, to save readers from having to consult the SAM3X8E datasheet as much as I had to.
